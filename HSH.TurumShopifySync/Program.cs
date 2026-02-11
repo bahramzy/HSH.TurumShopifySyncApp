@@ -38,8 +38,8 @@ namespace HSH.TurumShopifySync
 
         private static bool EqualsIgnoreCase(string a, string b) => string.Equals((a ?? "").Trim(), (b ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
 
-        private static readonly string ShopifyAdminToken = "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"; //Environment.GetEnvironmentVariable("SHOPIFY_ADMIN_TOKEN");
-        private static readonly string TurumToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoaWdoc3RyZWV0aGVhdmVuMjRAZ21haWwuY29tIiwicm9sZSI6InR1cnVtX2N1c3RvbWVyIiwiZXhwIjoxNzcwODA5MzEzfQ.4h_vH4aDYQqGvRzqyhib8V1LKqS3wCec4-0aqjyl1zw";//Environment.GetEnvironmentVariable("TURUM_TOKEN");
+        private static readonly string ShopifyAdminToken = "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"; //Environment.GetEnvironmentVariable("SHOPIFY_ADMIN_TOKEN");
+        private static readonly string TurumToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoaWdoc3RyZWV0aGVhdmVuMjRAZ21haWwuY29tIiwicm9sZSI6InR1cnVtX2N1c3RvbWVyIiwiZXhwIjoxNzcwOTAwODU0fQ.8uH-P970GDxQgeuf1LlSaJUAjq5JL6a__0LMWDeUbpI";//Environment.GetEnvironmentVariable("TURUM_TOKEN");
 
         private static void Main(string[] args)
         {
@@ -69,8 +69,14 @@ namespace HSH.TurumShopifySync
             #endregion
 
             // .NET Framework: async Main not available (unless newer compiler tricks)
+
+            // Start high-resolution timer
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
             try
             {
+
+                // Run main flow (synchronously waiting)
                 RunAsync().GetAwaiter().GetResult();
             }
             catch (Exception ex)
@@ -78,6 +84,21 @@ namespace HSH.TurumShopifySync
                 Console.WriteLine(ex);
                 Console.WriteLine(ex.Message);
                 Environment.ExitCode = 1;
+            }
+            finally
+            {
+                // Always stop and print elapsed time, even after exceptions
+                stopwatch.Stop();
+
+                // Always stop and print elapsed time, even after exceptions
+                stopwatch.Stop();
+
+                Console.WriteLine();
+                Console.WriteLine("=================================================");
+                Console.WriteLine("Turum Shopify Sync finished: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                Console.WriteLine("Elapsed time: " + stopwatch.Elapsed.ToString(@"hh\:mm\:ss\.fff"));
+                Console.WriteLine("Elapsed milliseconds: " + stopwatch.ElapsedMilliseconds + " ms");
+                Console.WriteLine("=================================================");
             }
         }
 
@@ -97,8 +118,10 @@ namespace HSH.TurumShopifySync
                 Console.WriteLine("Using Shopify location ID: " + locationId);
 
                 // Build SKU -> productId map (paged)
-                var skuIndex = await BuildShopifySkuIndexAsync(shopifyHttp, ct);
-                Console.WriteLine("Indexed SKUs from Shopify: " + skuIndex.Count);
+                var skuIndexes = await BuildShopifySkuIndexesAsync(shopifyHttp, ct);
+                var activeSkuIndex = skuIndexes.Active;
+                var archivedSkuIndex = skuIndexes.Archived;
+                Console.WriteLine("Indexed SKUs from Shopify: Active=" + activeSkuIndex.Count + " Archived=" + archivedSkuIndex.Count);
 
                 // Fetch Turum products
                 var turumProducts = await FetchTurumProductsAsync(turumHttp, TurumToken, ct);
@@ -129,16 +152,41 @@ namespace HSH.TurumShopifySync
                         var includeImage = await IsValidImageUrlAsync(p.image, ct);
 
                         // Check if SKU already exists
-                        if (skuIndex.TryGetValue(p.sku, out productId))
+                        if (activeSkuIndex.TryGetValue(p.sku, out productId))
                         {
-                            existingProductDoc = await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                            //existingProductDoc = await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                            existingProductDoc = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
 
                             // NEW RULE: if tagged "PO" → force new product
                             if (HasTag(existingProductDoc, "PO"))
                                 mustCreateNewBecausePo = true;
                         }
+                        else if (archivedSkuIndex.TryGetValue(p.sku, out productId))
+                        {
+                            Console.WriteLine("[INFO] SKU " + p.sku + " exists but archived. Unarchive and treat as update.");
 
-                        if (!skuIndex.ContainsKey(p.sku) || mustCreateNewBecausePo)
+                            // Unarchive the product first
+                            var unarchivePayload = new
+                            {
+                                product = new
+                                {
+                                    id = productId,
+                                    status = "active"
+                                }
+                            };
+
+                            await ShopifyPutAsync<dynamic>(shopifyHttp, "products/" + productId + ".json", unarchivePayload, d => d, ct);
+
+                            // Move it from archived index to active index
+                            archivedSkuIndex.Remove(p.sku);
+                            activeSkuIndex[p.sku] = productId;
+
+                            // Continue with update flow (fetch product from shopify)
+                            //existingProductDoc = await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                            existingProductDoc = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                        }
+
+                        if (!activeSkuIndex.ContainsKey(p.sku) || mustCreateNewBecausePo)
                         {
                             // ======================
                             // CREATE PRODUCT
@@ -181,7 +229,7 @@ namespace HSH.TurumShopifySync
                             var brandCollectionId = await GetOrCreateCustomCollectionIdAsync(shopifyHttp, p.brand, ct);
                             await EnsureProductInCollectionAsync(shopifyHttp, productId, brandCollectionId, ct);
 
-                            skuIndex[p.sku] = productId;
+                            activeSkuIndex[p.sku] = productId;
 
                             created++;
                             Console.WriteLine("CREATED SKU " + p.sku + " -> product " + productId);
@@ -218,7 +266,8 @@ namespace HSH.TurumShopifySync
                         }
                         
                         // Always fetch product to get variants + inventory_item_id
-                        var shopifyProduct = existingProductDoc ?? await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                        //var shopifyProduct = existingProductDoc ?? await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                        var shopifyProduct = existingProductDoc ?? await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
 
                         // Upsert variants (by size) + inventory set
                         var variantsCreated = await UpsertVariantsBySizeAsync(shopifyHttp, productId, shopifyProduct, p, ct);
@@ -226,7 +275,8 @@ namespace HSH.TurumShopifySync
                         // Refresh (if new variants were created)
                         if (variantsCreated)
                         {
-                            shopifyProduct = await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                            //shopifyProduct = await GetShopifyProductAsync(shopifyHttp, productId, ct);
+                            shopifyProduct = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
                         }
 
                         // Reorder variants if we need to
@@ -240,7 +290,7 @@ namespace HSH.TurumShopifySync
                         }
                         else
                         {
-                            Console.WriteLine("[INFO] SKIP reorder (already ordered). SKU " + p.sku);
+                            //Console.WriteLine("[INFO] SKIP reorder (already ordered). SKU " + p.sku);
                         }
 
                         // Inventory
@@ -261,7 +311,7 @@ namespace HSH.TurumShopifySync
                 // After main sync loop:
                 Console.WriteLine();
                 Console.WriteLine("[INFO] Starting cleanup of missing Turum products...");
-                await ArchiveAndCleanupMissingTurumProductsAsync(shopifyHttp, turumProducts, skuIndex, ct);
+                await ArchiveAndCleanupMissingTurumProductsAsync(shopifyHttp, turumProducts, activeSkuIndex, ct);
 
             }
         }
@@ -269,7 +319,7 @@ namespace HSH.TurumShopifySync
         // ==========================
         // CLEANUP: Archive Shopify products missing in Turum feed
         // ==========================
-        private static async Task ArchiveAndCleanupMissingTurumProductsAsync(HttpClient shopify, IList<TurumProduct> turumProducts, Dictionary<string, long> skuIndex, CancellationToken ct)
+        private static async Task ArchiveAndCleanupMissingTurumProductsAsync(HttpClient shopify, IList<TurumProduct> turumProducts, Dictionary<string, long> activeSkuIndex, CancellationToken ct)
         {
             // 1) Build set of current Turum SKUs
             var turumSkus = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -279,14 +329,14 @@ namespace HSH.TurumShopifySync
                 if (sku.Length > 0) turumSkus.Add(sku);
             }
 
-            Console.WriteLine("[INFO] Cleanup: Turum SKUs=" + turumSkus.Count + " Shopify SKUs indexed=" + skuIndex.Count);
+            Console.WriteLine("[INFO] Cleanup: Turum SKUs=" + turumSkus.Count + " Shopify SKUs indexed=" + activeSkuIndex.Count);
 
             int checkedCount = 0;
             int archivedCount = 0;
             int keptCount = 0;
             int deletedVariantsTotal = 0;
 
-            foreach (var kvp in skuIndex)
+            foreach (var kvp in activeSkuIndex)
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -544,6 +594,66 @@ namespace HSH.TurumShopifySync
         // ==========================
         // SHOPIFY: BUILD SKU INDEX (sku -> productId) by paging all products
         // ==========================
+
+        private static async Task<ShopifySkuIndexes> BuildShopifySkuIndexesAsync(HttpClient shopify, CancellationToken ct)
+        {
+            var res = new ShopifySkuIndexes();
+
+            // Pull ALL products, but only fields we need. We need status and variants.sku and id.
+            // Note: products.json supports status=active|archived|draft|any
+            // We'll fetch active+draft first, then archived.
+            await FillIndexByStatusAsync(shopify, "active", res.Active, ct);
+            //await FillIndexByStatusAsync(shopify, "draft", res.Active, ct);
+            await FillIndexByStatusAsync(shopify, "archived", res.Archived, ct);
+
+            return res;
+        }
+
+        private static async Task FillIndexByStatusAsync(
+            HttpClient shopify,
+            string status,
+            Dictionary<string, long> index,
+            CancellationToken ct)
+        {
+            string relativeUrl =
+                "products.json?limit=250"
+                + "&status=" + status
+                + "&fields=id,variants";
+
+            while (!string.IsNullOrEmpty(relativeUrl))
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, relativeUrl);
+
+                using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
+                {
+                    resp.EnsureSuccessStatusCode();
+
+                    var json = await resp.Content.ReadAsStringAsync();
+                    dynamic doc = JsonConvert.DeserializeObject(json);
+
+                    foreach (var p in doc.products)
+                    {
+                        long productId = ToLong(p.id);
+
+                        if (p.variants == null)
+                            continue;
+
+                        foreach (var v in p.variants)
+                        {
+                            var sku = ((string)v.sku ?? "").Trim();
+                            if (sku.Length == 0)
+                                continue;
+
+                            if (!index.ContainsKey(sku))
+                                index[sku] = productId;
+                        }
+                    }
+
+                    relativeUrl = TryGetNextPageRelativeUrl(resp);
+                }
+            }
+        }
+
         private static async Task<Dictionary<string, long>> BuildShopifySkuIndexAsync(HttpClient shopify, CancellationToken ct)
         {
             var map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
@@ -899,7 +1009,78 @@ namespace HSH.TurumShopifySync
         // ==========================
         // SHOPIFY: INVENTORY (set to Turum stock; missing sizes -> 0)
         // ==========================
-        private static async Task SetInventoryFromTurumAsync(HttpClient shopify, long locationId, dynamic shopifyProductDoc, TurumProduct turum, CancellationToken ct)
+
+        //private static async Task SetInventoryFromTurumAsync(HttpClient shopify, long locationId, dynamic shopifyProductDoc, TurumProduct turum, CancellationToken ct)
+        //{
+        //    var stockBySize = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        //    foreach (var v in turum.variants)
+        //    {
+        //        var size = (v.eu_size ?? v.size);
+        //        if (string.IsNullOrWhiteSpace(size))
+        //            continue;
+
+        //        stockBySize[size.Trim()] = v.stock;
+        //    }
+
+        //    foreach (var sv in shopifyProductDoc.product.variants)
+        //    {
+        //        string size = (string)(sv.option1 ?? sv.title ?? "");
+        //        if (string.IsNullOrWhiteSpace(size))
+        //            continue;
+
+        //        size = size.Trim();
+
+        //        int available;
+        //        if (!stockBySize.TryGetValue(size, out available))
+        //        {
+        //            //available = 0;
+        //            // If size not in TURUM, do NOT touch Shopify inventory
+        //            continue;
+        //        }
+
+        //        long inventoryItemId = (long)sv.inventory_item_id;
+
+        //        int currentQty = 0;
+        //        try
+        //        {
+        //            // Shopify returns inventory_quantity on variant in many product responses
+        //            currentQty = (int)sv.inventory_quantity;
+        //        }
+        //        catch
+        //        {
+        //            // if missing, keep 0 and proceed with update
+        //        }
+
+        //        //Console.WriteLine($"[INV-CHECK] SKU {turum.sku} size {size} | Shopify={currentQty} Turum={available}");
+
+
+        //        if (currentQty == available)
+        //        {
+        //            //Console.WriteLine($"[INV-SKIP] SKU {turum.sku} size {size} (no change)");
+
+        //            // skip inventory update
+        //            //Console.WriteLine("SKIP inventory update...");
+        //            continue;
+        //        }
+
+        //        var payload = new
+        //        {
+        //            location_id = locationId,
+        //            inventory_item_id = inventoryItemId,
+        //            available = available
+        //        };
+
+        //        await ShopifyPostAsync<dynamic>(shopify, "inventory_levels/set.json", payload, doc => doc, ct);
+        //    }
+        //}
+
+        private static async Task SetInventoryFromTurumAsync(
+            HttpClient shopify,
+            long locationId,
+            dynamic shopifyProductDoc,   // normalized: { product = { variants = [...] } }
+            TurumProduct turum,
+            CancellationToken ct)
         {
             var stockBySize = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
@@ -914,26 +1095,56 @@ namespace HSH.TurumShopifySync
 
             foreach (var sv in shopifyProductDoc.product.variants)
             {
+                // REST-style: option1 is typically the Size
                 string size = (string)(sv.option1 ?? sv.title ?? "");
                 if (string.IsNullOrWhiteSpace(size))
                     continue;
 
                 size = size.Trim();
 
-                int available;
-                if (!stockBySize.TryGetValue(size, out available))
+                if (!stockBySize.TryGetValue(size, out var availableFromTurum))
                 {
-                    //available = 0;
                     // If size not in TURUM, do NOT touch Shopify inventory
                     continue;
                 }
+
+                // Read custom.hsh_antal from injected metafields
+                int extra = 0;
+                try
+                {
+                    if (sv.metafields != null)
+                    {
+                        foreach (var mf in sv.metafields)
+                        {
+                            var ns = (string)mf.@namespace;
+                            var key = (string)mf.key;
+
+                            if (!"custom".Equals(ns, StringComparison.OrdinalIgnoreCase)) continue;
+                            if (!"hsh_antal".Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+
+                            var s = (string)mf.value;
+                            if (!string.IsNullOrWhiteSpace(s) && int.TryParse(s, out var parsed))
+                                extra = parsed;
+
+                            break;
+                        }
+                    }
+                }
+                catch
+                {
+                    // ignore metafield issues, treat as 0
+                }
+
+                if (extra < 0) extra = 0;
+
+                int available = availableFromTurum + extra;
 
                 long inventoryItemId = (long)sv.inventory_item_id;
 
                 int currentQty = 0;
                 try
                 {
-                    // Shopify returns inventory_quantity on variant in many product responses
+                    // normalized uses REST-style name
                     currentQty = (int)sv.inventory_quantity;
                 }
                 catch
@@ -942,11 +1153,7 @@ namespace HSH.TurumShopifySync
                 }
 
                 if (currentQty == available)
-                {
-                    // skip inventory update
-                    //Console.WriteLine("SKIP inventory update...");
                     continue;
-                }
 
                 var payload = new
                 {
@@ -1878,6 +2085,212 @@ namespace HSH.TurumShopifySync
             return mergedTags;
 
         }
+
+
+
+        //
+        // GrapghQL API 
+        //
+
+        private static async Task<T> ShopifyGraphQlAsync<T>(HttpClient shopify, string query, object variables, CancellationToken ct)
+        {
+            var payload = new
+            {
+                query,
+                variables
+            };
+
+            var json = JsonConvert.SerializeObject(payload);
+
+            using (var req = new HttpRequestMessage(HttpMethod.Post, "graphql.json"))
+            {
+                req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
+                {
+                    resp.EnsureSuccessStatusCode();
+                    var respJson = await resp.Content.ReadAsStringAsync();
+                    return JsonConvert.DeserializeObject<T>(respJson);
+                }
+            }
+        }
+
+        private static async Task<dynamic> GetShopifyProductGraphQlAsync(
+            HttpClient shopify,
+            long productId,
+            CancellationToken ct)
+        {
+            var gid = $"gid://shopify/Product/{productId}";
+
+            const string query = @"
+                    query ($id: ID!) {
+                      product(id: $id) {
+                        id
+                        title
+                        vendor
+                        productType
+                        tags
+                        options {
+                          name
+                          values
+                        }
+                        variants(first: 250) {
+                          edges {
+                            node {
+                              id
+                              title
+                              price
+                              position
+                              barcode
+                              selectedOptions { name value }
+                              inventoryQuantity
+                              inventoryItem { legacyResourceId }
+                              metafield(namespace: ""custom"", key: ""hsh_antal"") { value }
+                            }
+                          }
+                        }
+                      }
+                    }";
+
+            dynamic gql = await ShopifyGraphQlAsync<dynamic>(shopify, query, new { id = gid }, ct);
+            var p = gql?.data?.product;
+            if (p == null)
+                return new { product = (object)null };
+
+            // Convert tags list -> CSV string (REST-style)
+            string tagsCsv = "";
+            try
+            {
+                var tagsList = new List<string>();
+                foreach (var t in p.tags)
+                    tagsList.Add((string)t);
+
+                tagsCsv = string.Join(", ", tagsList); // REST usually comes back comma+space
+            }
+            catch { tagsCsv = ""; }
+
+            // Flatten variants to REST-style array
+            var flatVariants = new List<object>();
+
+            try
+            {
+                foreach (var edge in p.variants.edges)
+                {
+                    var n = edge.node;
+
+                    // option1 (Size) from selectedOptions; fallback to title
+                    string option1 = null;
+                    try
+                    {
+                        foreach (var opt in n.selectedOptions)
+                        {
+                            if (((string)opt.name).Equals("Size", StringComparison.OrdinalIgnoreCase))
+                            {
+                                option1 = (string)opt.value;
+                                break;
+                            }
+                        }
+
+                        if (string.IsNullOrWhiteSpace(option1) && n.selectedOptions != null)
+                            option1 = (string)n.selectedOptions[0].value;
+                    }
+                    catch { /* ignore */ }
+
+                    if (string.IsNullOrWhiteSpace(option1))
+                        option1 = (string)(n.title ?? "");
+
+                    // Build REST-like variant object
+                    var metafields = new List<object>();
+                    try
+                    {
+                        var mfVal = (string)n.metafield?.value;
+                        if (!string.IsNullOrWhiteSpace(mfVal))
+                        {
+                            metafields.Add(new
+                            {
+                                @namespace = "custom",
+                                key = "hsh_antal",
+                                value = mfVal
+                            });
+                        }
+                    }
+                    catch { /* ignore */ }
+
+                    flatVariants.Add(new
+                    {
+                        id = ExtractLegacyIdFromGid((string)n.id), // numeric variant id (optional, but nice)
+                        title = (string)n.title,
+                        price = n.price,
+                        position = n.position,
+                        barcode = (string)n.barcode,
+                        option1 = option1,
+                        inventory_quantity = (int)(n.inventoryQuantity ?? 0),
+                        inventory_item_id = (long)n.inventoryItem.legacyResourceId,
+                        metafields = metafields
+                    });
+                }
+            }
+            catch
+            {
+                // if variants missing, keep empty list
+            }
+
+            // Return object shaped like REST: { product: { ... } }
+            return new
+            {
+                product = new
+                {
+                    id = ExtractLegacyIdFromGid((string)p.id),
+                    title = (string)p.title,
+                    vendor = (string)p.vendor,
+                    product_type = (string)p.productType,
+                    tags = tagsCsv, // CSV string
+                    options = NormalizeOptions(p.options),
+                    variants = flatVariants
+                }
+            };
+        }
+
+        // Shopify GraphQL IDs are like: gid://shopify/ProductVariant/1234567890
+        private static long ExtractLegacyIdFromGid(string gid)
+        {
+            if (string.IsNullOrWhiteSpace(gid)) return 0;
+            var idx = gid.LastIndexOf('/');
+            if (idx < 0 || idx == gid.Length - 1) return 0;
+            var tail = gid.Substring(idx + 1);
+            return long.TryParse(tail, out var id) ? id : 0;
+        }
+
+        private static List<object> NormalizeOptions(dynamic options)
+        {
+            var list = new List<object>();
+            try
+            {
+                foreach (var o in options)
+                {
+                    var values = new List<string>();
+                    foreach (var v in o.values)
+                        values.Add((string)v);
+
+                    list.Add(new
+                    {
+                        name = (string)o.name,
+                        values = values
+                    });
+                }
+            }
+            catch { }
+
+            return list;
+        }
+
+
+    }
+
+    public class ShopifySkuIndexes
+    {
+        public Dictionary<string, long> Active = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, long> Archived = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
     }
 
     // ==========================
