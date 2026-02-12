@@ -104,15 +104,41 @@ namespace HSH.TurumShopifySync
 
         private static async Task RunAsync()
         {
-            if (string.IsNullOrWhiteSpace(ShopifyAdminToken))
-                throw new Exception("Missing env var SHOPIFY_ADMIN_TOKEN");
-            if (string.IsNullOrWhiteSpace(TurumToken))
-                throw new Exception("Missing env var TURUM_TOKEN");
-
             var ct = CancellationToken.None;
 
+            HttpClient shopifyHttp = null;
+
+            // Prefer client id / secret from env variables (auto-refresh)
+            /*
+             * Set these evinvironment variables in your system or development environment to enable auto-refreshing tokens:
+             * Open an elevated or normal PowerShell (for current user), run the commands and restart VS or whatever you use to run the code:
+             * setx SHOPIFY_CLIENT_ID "your-client-id"
+             * setx SHOPIFY_CLIENT_SECRET "your-client-secret"
+             */
+            var clientId = Environment.GetEnvironmentVariable("SHOPIFY_CLIENT_ID");
+            var clientSecret = Environment.GetEnvironmentVariable("SHOPIFY_CLIENT_SECRET");
+            if (!string.IsNullOrWhiteSpace(clientId) && !string.IsNullOrWhiteSpace(clientSecret))
+            {
+                var tokenProvider = new ShopifyTokenProvider(ShopifyStoreDomain, clientId, clientSecret);
+                shopifyHttp = CreateShopifyClient(ShopifyStoreDomain, tokenProvider, ShopifyApiVersion);
+                Console.WriteLine("Shopify client: using token provider (auto-refresh).");
+            }
+            else
+            {
+                // Fallback to static admin token (unchanged behavior)
+
+                if (string.IsNullOrWhiteSpace(ShopifyAdminToken))
+                    throw new Exception("Missing env var SHOPIFY_ADMIN_TOKEN");
+                if (string.IsNullOrWhiteSpace(TurumToken))
+                    throw new Exception("Missing env var TURUM_TOKEN");
+
+                shopifyHttp = CreateShopifyClient(ShopifyStoreDomain, ShopifyAdminToken, ShopifyApiVersion);
+                Console.WriteLine("Shopify client: using static admin token (no auto-refresh).");
+            }
+
             using (var turumHttp = new HttpClient())
-            using (var shopifyHttp = CreateShopifyClient(ShopifyStoreDomain, ShopifyAdminToken, ShopifyApiVersion))
+            //using (var shopifyHttp = CreateShopifyClient(ShopifyStoreDomain, ShopifyAdminToken, ShopifyApiVersion))
+            using (shopifyHttp) // created above with possible token provider
             {
                 var locationId = await GetFirstShopifyLocationIdAsync(shopifyHttp, ct);
                 Console.WriteLine("Using Shopify location ID: " + locationId);
@@ -301,7 +327,11 @@ namespace HSH.TurumShopifySync
                         processed++;
                         var pct = (processed * 100) / total;
 
-                        Console.WriteLine($"Processed {processed}/{total} ({pct}%)");
+                        // Print only every 10th time or on the final item
+                        if (processed % 10 == 0 || processed == total)
+                        {
+                            Console.WriteLine($"Processed {processed}/{total} ({pct}%)");
+                        }
                     }
                 }
 
@@ -576,6 +606,32 @@ namespace HSH.TurumShopifySync
             };
 
             client.DefaultRequestHeaders.Add("X-Shopify-Access-Token", adminToken);
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            return client;
+        }
+
+        // --- Add overload for CreateShopifyClient that accepts the token provider ---
+        private static HttpClient CreateShopifyClient(string storeDomain, ShopifyTokenProvider tokenProvider, string apiVersion)
+        {
+            // .NET Framework network tuning (do once)
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 50;
+            ServicePointManager.Expect100Continue = false;
+
+            var handler = new TokenRefreshHandler(tokenProvider)
+            {
+                InnerHandler = new HttpClientHandler
+                {
+                    AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+                }
+            };
+
+            var client = new HttpClient(handler)
+            {
+                BaseAddress = new Uri("https://" + storeDomain + "/admin/api/" + apiVersion + "/"),
+                Timeout = TimeSpan.FromMinutes(5)
+            };
+
             client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             return client;
         }
@@ -2321,4 +2377,114 @@ namespace HSH.TurumShopifySync
         public string eu_size { get; set; }
         public string ean { get; set; }
     }
+
+    // ==========================
+    // Shopify Token Refresh logic
+    // ==========================
+
+    public sealed class TokenResponse
+    {
+        // Matches the JSON you receive from your token endpoint.
+        public string access_token { get; set; }
+        public int expires_in { get; set; } // seconds (if present)
+    }
+
+    public sealed class ShopifyTokenProvider
+    {
+        private readonly string _storeDomain;
+        private readonly string _clientId;
+        private readonly string _clientSecret;
+        private readonly HttpClient _http = new HttpClient();
+        private readonly SemaphoreSlim _mutex = new SemaphoreSlim(1, 1);
+
+        private string _accessToken;
+        private DateTime _expiresAtUtc = DateTime.MinValue;
+
+        public ShopifyTokenProvider(string storeDomain, string clientId, string clientSecret)
+        {
+            _storeDomain = storeDomain ?? throw new ArgumentNullException(nameof(storeDomain));
+            _clientId = clientId ?? throw new ArgumentNullException(nameof(clientId));
+            _clientSecret = clientSecret ?? throw new ArgumentNullException(nameof(clientSecret));
+        }
+
+        public async Task<string> GetAccessTokenAsync(CancellationToken ct = default)
+        {
+            // Prevent concurrent refreshes
+            await _mutex.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                // If token exists and is not close to expiry, return it.
+                if (!string.IsNullOrWhiteSpace(_accessToken) &&
+                    DateTime.UtcNow < _expiresAtUtc - TimeSpan.FromMinutes(5))
+                {
+                    return _accessToken;
+                }
+
+                // Request new token
+                var url = $"https://{_storeDomain}/admin/oauth/access_token";
+                using (var req = new HttpRequestMessage(HttpMethod.Post, url))
+                {
+                    var form = new[]
+                    {
+                    new KeyValuePair<string, string>("grant_type", "client_credentials"),
+                    new KeyValuePair<string, string>("client_id", _clientId),
+                    new KeyValuePair<string, string>("client_secret", _clientSecret)
+                };
+
+                    req.Content = new FormUrlEncodedContent(form);
+
+                    using (var resp = await _http.SendAsync(req, ct).ConfigureAwait(false))
+                    {
+                        resp.EnsureSuccessStatusCode();
+                        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        TokenResponse dto = null;
+                        try { dto = JsonConvert.DeserializeObject<TokenResponse>(json); } catch { /* ignore */ }
+
+                        if (dto == null || string.IsNullOrWhiteSpace(dto.access_token))
+                            throw new Exception("Failed to obtain Shopify access token.");
+
+                        _accessToken = dto.access_token;
+
+                        if (dto.expires_in > 0)
+                            _expiresAtUtc = DateTime.UtcNow.AddSeconds(dto.expires_in);
+                        else
+                            // If server doesn't return expires_in, pick sensible default (23h).
+                            _expiresAtUtc = DateTime.UtcNow.AddHours(23);
+
+                        return _accessToken;
+                    }
+                }
+            }
+            finally
+            {
+                _mutex.Release();
+            }
+        }
+    }
+
+    public sealed class TokenRefreshHandler : DelegatingHandler
+    {
+        private readonly ShopifyTokenProvider _provider;
+
+        public TokenRefreshHandler(ShopifyTokenProvider provider)
+        {
+            _provider = provider ?? throw new ArgumentNullException(nameof(provider));
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            // Ensure we have a fresh token for each outgoing request.
+            var token = await _provider.GetAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+
+            // Replace any existing X-Shopify-Access-Token header (safe).
+            if (request.Headers.Contains("X-Shopify-Access-Token"))
+                request.Headers.Remove("X-Shopify-Access-Token");
+
+            request.Headers.Add("X-Shopify-Access-Token", token);
+
+            return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+
 }
