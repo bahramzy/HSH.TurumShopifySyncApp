@@ -39,7 +39,7 @@ namespace HSH.TurumShopifySync
         private static bool EqualsIgnoreCase(string a, string b) => string.Equals((a ?? "").Trim(), (b ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
 
         private static readonly string ShopifyAdminToken = "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"; //Environment.GetEnvironmentVariable("SHOPIFY_ADMIN_TOKEN");
-        private static readonly string TurumToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoaWdoc3RyZWV0aGVhdmVuMjRAZ21haWwuY29tIiwicm9sZSI6InR1cnVtX2N1c3RvbWVyIiwiZXhwIjoxNzcwOTAwODU0fQ.8uH-P970GDxQgeuf1LlSaJUAjq5JL6a__0LMWDeUbpI";//Environment.GetEnvironmentVariable("TURUM_TOKEN");
+        private static readonly string TurumToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoaWdoc3RyZWV0aGVhdmVuMjRAZ21haWwuY29tIiwicm9sZSI6InR1cnVtX2N1c3RvbWVyIiwiZXhwIjoxNzcxMTUyOTc1fQ.12WsPrft2n7IenuAK8kV7y-YoTK553bBTuIKcxR39XI";//Environment.GetEnvironmentVariable("TURUM_TOKEN");
 
         private static void Main(string[] args)
         {
@@ -107,6 +107,7 @@ namespace HSH.TurumShopifySync
             var ct = CancellationToken.None;
 
             HttpClient shopifyHttp = null;
+            HttpClient turumHttp = null;
 
             // Prefer client id / secret from env variables (auto-refresh)
             /*
@@ -136,8 +137,25 @@ namespace HSH.TurumShopifySync
                 Console.WriteLine("Shopify client: using static admin token (no auto-refresh).");
             }
 
-            using (var turumHttp = new HttpClient())
-            //using (var shopifyHttp = CreateShopifyClient(ShopifyStoreDomain, ShopifyAdminToken, ShopifyApiVersion))
+            // Turum token auto-refresh: prefer TURUM_USERNAME & TURUM_PASSWORD env vars
+            var turumUser = Environment.GetEnvironmentVariable("TURUM_USERNAME");
+            var turumPass = Environment.GetEnvironmentVariable("TURUM_PASSWORD");
+            if (!string.IsNullOrWhiteSpace(turumUser) && !string.IsNullOrWhiteSpace(turumPass))
+            {
+                var turumProvider = new TurumTokenProvider(turumUser, turumPass);
+                turumHttp = CreateTurumClient(turumProvider);
+                Console.WriteLine("Turum client: using token provider (auto-refresh).");
+            }
+            else
+            {
+                // fallback to static token
+                if (string.IsNullOrWhiteSpace(TurumToken))
+                    throw new Exception("Missing env var TURUM_TOKEN or TURUM_USERNAME/TURUM_PASSWORD");
+                turumHttp = CreateTurumClient(TurumToken);
+                Console.WriteLine("Turum client: using static token (no auto-refresh).");
+            }
+
+            using (turumHttp)
             using (shopifyHttp) // created above with possible token provider
             {
                 var locationId = await GetFirstShopifyLocationIdAsync(shopifyHttp, ct);
@@ -150,7 +168,7 @@ namespace HSH.TurumShopifySync
                 Console.WriteLine("Indexed SKUs from Shopify: Active=" + activeSkuIndex.Count + " Archived=" + archivedSkuIndex.Count);
 
                 // Fetch Turum products
-                var turumProducts = await FetchTurumProductsAsync(turumHttp, TurumToken, ct);
+                var turumProducts = await FetchTurumProductsAsync(turumHttp, ct);
                 Console.WriteLine("Fetched TURUM products: " + turumProducts.Count);
 
                 int created = 0, updated = 0;
@@ -189,6 +207,13 @@ namespace HSH.TurumShopifySync
                         }
                         else if (archivedSkuIndex.TryGetValue(p.sku, out productId))
                         {
+                            // Unarchive only if the image is valid. Skip otherwise.
+                            if (!includeImage)
+                            {
+                                Console.WriteLine("[WARN] SKU " + p.sku + " exists but archived, and image URL is invalid. Keep it archived and skip. SKU " + p.sku + " url " + p.image);
+                                continue;
+                            }
+
                             Console.WriteLine("[INFO] SKU " + p.sku + " exists but archived. Unarchive and treat as update.");
 
                             // Unarchive the product first
@@ -217,6 +242,14 @@ namespace HSH.TurumShopifySync
                             // ======================
                             // CREATE PRODUCT
                             // ======================
+
+                            // Skip if the image is invalid
+                            if (!includeImage)
+                            {
+                                Console.WriteLine("[WARN] Invalid image URL, Skip product creation. SKU " + p.sku + " url " + p.image);
+                                continue;
+                            }
+
                             var createPayload = BuildShopifyCreateProductPayload(p, includeImage, category);
 
                             try
@@ -266,10 +299,13 @@ namespace HSH.TurumShopifySync
                             // UPDATE PRODUCT
                             // ======================
 
+                            // Update image
+                            await ReplaceProductImagesAsync(shopifyHttp, productId, p.image, p.name, ct);
+
                             // CLEANUP and merge tags
                             string mergedTags = TagsMergeAndCleanUp(existingProductDoc, p, category);
 
-                            var needsProductUpdate = ProductUpdateNeeded(existingProductDoc, p.name, "TURUM B2B", category, mergedTags);
+                            var needsProductUpdate = ProductUpdateNeeded(existingProductDoc, p.name, p.brand, category, mergedTags);
                             if (needsProductUpdate)
                             {
                                 var updatePayload = BuildShopifyUpdateProductPayload(productId, p, mergedTags, category);
@@ -283,9 +319,6 @@ namespace HSH.TurumShopifySync
                             {
                                 //Console.WriteLine("SKIP product update (unchanged) SKU " + p.sku);
                             }
-
-                            // NEW: update image
-                            await ReplaceProductImagesAsync(shopifyHttp, productId, p.image, p.name, ct);
 
                             // Ensure category is Sneakers. (uncomment if necessary)
                             //await SetShopifyCategorySneakersAsync(shopifyHttp, productId, ct);
@@ -390,7 +423,7 @@ namespace HSH.TurumShopifySync
                     ct);
 
                 // SAFETY GUARD — Only TURUM-PRODUCT
-                if (!EqualsIgnoreCase((string)productDoc.product.vendor, "TURUM B2B"))
+                if (!HasTag(productDoc, "TURUM"))
                 {
                     Console.WriteLine(
                         "SKIP archive (not Turum product) productId " + productId);
@@ -417,18 +450,56 @@ namespace HSH.TurumShopifySync
                     Console.WriteLine("[INFO] Deleted " + deleted + " non-HSH variants. SKU " + sku);
                     keptCount++;
 
-                    // Set vendor to Highstreet Heaven, now that it's no longer Turum
-                    await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json",
-                        new
+                    // Remove tag TURUM (if present) from product tags. It is no longer TURUM product
+                    try
+                    {
+                        var existingTagsCsv = (string)(productDoc.product.tags ?? "");
+                        var tagsList = existingTagsCsv
+                            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(t => t.Trim())
+                            .Where(t => !string.Equals(t, "TURUM", StringComparison.OrdinalIgnoreCase) && t.Length > 0)
+                            .ToList();
+
+                        var newTagsCsv = string.Join(", ", tagsList);
+
+                        // Only update if tags changed (i.e., TURUM removed)
+                        if (!string.Equals(NormalizeTags(existingTagsCsv), NormalizeTags(newTagsCsv), StringComparison.OrdinalIgnoreCase))
                         {
-                            product = new
+                            var updatePayload = new
                             {
-                                id = productId,
-                                vendor = "Highstreet Heaven"
-                            }
-                        },
-                        d => d,
-                        ct);
+                                product = new
+                                {
+                                    id = productId,
+                                    tags = newTagsCsv
+                                }
+                            };
+
+                            await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json", updatePayload, d => d, ct);
+                            Console.WriteLine("[INFO] Removed TURUM tag from productId " + productId + " SKU " + sku + " NewTags: " + newTagsCsv);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("[WARN] Failed to remove TURUM tag for productId " + productId + ": " + ex.Message);
+                        // Non-fatal: continue sync
+                    }
+
+                    // Set vendor to Highstreet Heaven, now that it's no longer Turum
+                    //await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json",
+                    //    new
+                    //    {
+                    //        product = new
+                    //        {
+                    //            id = productId,
+                    //            vendor = "Highstreet Heaven" // we use vendor for the brand of the product
+                    //        }
+                    //    },
+                    //    d => d,
+                    //    ct);
+
+                    // Remove tag TURUM
+
+
 
                     continue;
                 }
@@ -554,11 +625,10 @@ namespace HSH.TurumShopifySync
         // ==========================
         // TURUM
         // ==========================
-        private static async Task<List<TurumProduct>> FetchTurumProductsAsync(HttpClient http, string bearerToken, CancellationToken ct)
+        private static async Task<List<TurumProduct>> FetchTurumProductsAsync(HttpClient http, CancellationToken ct)
         {
             var req = new HttpRequestMessage(HttpMethod.Get, "https://api.b2b.turum.pl/v1/products_full_list_new");
             req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
 
             using (var resp = await http.SendAsync(req, ct))
             {
@@ -573,13 +643,56 @@ namespace HSH.TurumShopifySync
             }
         }
 
+        private static HttpClient CreateTurumClient(TurumTokenProvider provider)
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 50;
+            ServicePointManager.Expect100Continue = false;
+
+            var handler = new TurumTokenRefreshHandler(provider)
+            {
+                InnerHandler = new HttpClientHandler
+                {
+                    AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+                }
+            };
+
+            var client = new HttpClient(handler)
+            {
+                BaseAddress = new Uri("https://api.b2b.turum.pl/v1/"),
+                Timeout = TimeSpan.FromMinutes(5)
+            };
+
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            return client;
+        }
+
+        private static HttpClient CreateTurumClient(string bearerToken)
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 50;
+            ServicePointManager.Expect100Continue = false;
+
+            var client = new HttpClient
+            {
+                BaseAddress = new Uri("https://api.b2b.turum.pl/v1/"),
+                Timeout = TimeSpan.FromMinutes(5)
+            };
+
+            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            if (!string.IsNullOrWhiteSpace(bearerToken))
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+
+            return client;
+        }
+
         // Get a single TURUM product by SKU (not used in main flow, but can be useful for testing)
         // {{baseUrl}}/v1/product/:sku
-        private static async Task<TurumProduct> FetchTurumProductBySkuAsync(HttpClient http, string bearerToken, string sku, CancellationToken ct)
+        private static async Task<TurumProduct> FetchTurumProductBySkuAsync(HttpClient http, string sku, CancellationToken ct)
         {
             var req = new HttpRequestMessage(HttpMethod.Get, "https://api.b2b.turum.pl/v1/product/" + WebUtility.UrlEncode(sku));
             req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+            
             using (var resp = await http.SendAsync(req, ct))
             {
                 resp.EnsureSuccessStatusCode();
@@ -803,27 +916,75 @@ namespace HSH.TurumShopifySync
 
             // existingBySize: option1 -> variant object
             var existingBySize = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
+            var existingSizes = new List<string>();
             bool blockNewVariantCreation = false;
 
             var seenSizes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var sv in shopifyProductDoc.product.variants)
+            // Collect existing variants and sizes
+            try
             {
-                string size = (string)(sv.option1 ?? sv.title ?? "");
-                if (!string.IsNullOrWhiteSpace(size))
-                    existingBySize[size.Trim()] = sv;
+                foreach (var sv in shopifyProductDoc.product.variants)
+                {
+                    string size = (string)(sv.option1 ?? sv.title ?? "");
+                    if (string.IsNullOrWhiteSpace(size)) continue;
+                    size = size.Trim();
+
+                    if (!existingBySize.ContainsKey(size))
+                    {
+                        existingBySize[size] = sv;
+                        existingSizes.Add(size);
+                    }
+                }
+            }
+            catch
+            {
+                // If shopifyProductDoc shape is unexpected, fall back to empty existing set
             }
 
+            // Collect Turum sizes (deduped and in source order)
+            var turumSizes = new List<string>();
             foreach (var tv in turum.variants)
             {
                 var size = (tv.eu_size ?? tv.size);
-                if (string.IsNullOrWhiteSpace(size))
-                    continue;
+                if (string.IsNullOrWhiteSpace(size)) continue;
+                size = size.Trim();
+                if (!turumSizes.Contains(size, StringComparer.OrdinalIgnoreCase))
+                    turumSizes.Add(size);
+            }
 
+            // Desired sizes = union(existingSizes, turumSizes) then sorted by CompareSizes
+            var desiredSizes = new List<string>(existingSizes);
+            foreach (var s in turumSizes)
+            {
+                if (!desiredSizes.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    desiredSizes.Add(s);
+            }
+
+            desiredSizes.Sort(Comparer<string>.Create((a, b) => CompareSizes(a, b)));
+
+            // Helper: desired position (1-based) for a size
+            Func<string, int> getDesiredPosition = size =>
+            {
+                for (int i = 0; i < desiredSizes.Count; i++)
+                {
+                    if (string.Equals(desiredSizes[i], size, StringComparison.OrdinalIgnoreCase))
+                        return i + 1;
+                }
+                return desiredSizes.Count + 1;
+            };
+
+            // Keep created variants to position them after creation
+            var createdVariants = new List<(string size, long variantId)>();
+
+            // First pass: update existing variants' price/sku and create missing variants
+            foreach (var tv in turum.variants)
+            {
+                var size = (tv.eu_size ?? tv.size);
+                if (string.IsNullOrWhiteSpace(size)) continue;
                 size = size.Trim();
 
-                if (!seenSizes.Add(size))
-                    continue; // skip duplicate size from TURUM
+                if (!seenSizes.Add(size)) continue; // skip duplicates from TURUM
 
                 var raw = ConvertToDkk(tv.price) * MomsRate + Profit;
                 var dkk = RoundRetailPrice(raw);
@@ -831,21 +992,13 @@ namespace HSH.TurumShopifySync
                 dynamic existing;
                 if (existingBySize.TryGetValue(size, out existing))
                 {
-                    var oldPrice = ParseShopifyMoney(existing.price); // fx 845.00m
-                    var newPrice = dkk;                               // decimal fra RoundRetailPrice
+                    var oldPrice = ParseShopifyMoney(existing.price);
+                    var newPrice = dkk;
 
                     if (oldPrice == newPrice)
-                    {
-                        // No need to update this variant price
-                        //Console.WriteLine(
-                        //            "SKIP variant update (unchanged price) SKU " + turum.sku +
-                        //            " size " + size +
-                        //            " price " + newPrice.ToString("0", CultureInfo.InvariantCulture));
                         continue;
-                    }
 
-                    // Update variant: price, sku (same), barcode
-                    long variantId = (long)existing.id;
+                    long variantId = ToLong(existing.id);
 
                     var payload = new
                     {
@@ -853,8 +1006,7 @@ namespace HSH.TurumShopifySync
                         {
                             id = variantId,
                             price = dkk.ToString("0", CultureInfo.InvariantCulture),
-                            sku = turum.sku,
-                            //barcode = tv.ean // ean is always null in Turum response
+                            sku = turum.sku
                         }
                     };
 
@@ -862,20 +1014,18 @@ namespace HSH.TurumShopifySync
                 }
                 else
                 {
-                    if (blockNewVariantCreation)
-                        continue;
+                    if (blockNewVariantCreation) continue;
 
-                    // Create missing variant
                     var payload = new
                     {
                         variant = new
                         {
                             option1 = size,
                             price = dkk.ToString("0", CultureInfo.InvariantCulture),
-                            sku = turum.sku, // SAME SKU on all variants (your requirement)
+                            sku = turum.sku,
                             inventory_management = "shopify",
                             inventory_policy = "deny",
-                            taxable = true,
+                            taxable = false,
                             requires_shipping = true,
                             barcode = tv.ean
                         }
@@ -883,17 +1033,63 @@ namespace HSH.TurumShopifySync
 
                     try
                     {
-                        await ShopifyPostAsync<dynamic>(shopify, "products/" + productId + "/variants.json", payload, doc => doc, ct);
+                        // Create and capture response to obtain created variant id
+                        var resp = await ShopifyPostAsync<dynamic>(shopify, "products/" + productId + "/variants.json", payload, doc => doc, ct);
+
+                        // Log full create response for debugging
+                        try
+                        {
+                            Console.WriteLine("[DEBUG] Variant create response: " + JsonConvert.SerializeObject(resp));
+                        }
+                        catch { /* ignore logging errors */ }
+
+                        long createdVariantId = 0;
+                        try { createdVariantId = ToLong(resp.variant.id); } catch { createdVariantId = 0; }
 
                         createdAny = true;
+
+                        if (createdVariantId > 0)
+                        {
+                            createdVariants.Add((size, createdVariantId));
+                            Console.WriteLine("CREATED variant SKU " + turum.sku + " size " + size + " productId " + productId + " variantId " + createdVariantId);
+
+                            // Verify variant exists server-side (same store/token)
+                            try
+                            {
+                                dynamic vdoc = await ShopifyGetAsync<dynamic>(shopify, "variants/" + createdVariantId + ".json", ct);
+                                Console.WriteLine("[DEBUG] Fetched created variant " + createdVariantId + ": " + JsonConvert.SerializeObject(vdoc));
+                            }
+                            catch (Exception ex)
+                            {
+                                // 404 or other errors — surface for debugging
+                                Console.WriteLine("[WARN] Fetching created variant " + createdVariantId + " failed: " + ex.Message);
+                                Console.WriteLine("[WARN] You should inspect the POST response above and ensure Postman uses the same store/token and API version.");
+                            }
+
+                            // Fetch product to inspect options & variant list
+                            try
+                            {
+                                dynamic pdoc = await ShopifyGetAsync<dynamic>(shopify, "products/" + productId + ".json?fields=variants,options", ct);
+                                Console.WriteLine("[DEBUG] Product variants after create: " + JsonConvert.SerializeObject(pdoc.product.variants));
+                                Console.WriteLine("[DEBUG] Product options after create: " + JsonConvert.SerializeObject(pdoc.product.options));
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine("[WARN] Failed to fetch product after variant create: " + ex.Message);
+                            }
+                        }
+                        else
+                        {
+                            // No numeric id in response — log and throw to make failure visible
+                            Console.WriteLine("[ERROR] Variant create response did not include numeric id: " + JsonConvert.SerializeObject(resp));
+                            throw new Exception("Variant create returned no id for product " + productId + " size " + size);
+                        }
                     }
                     catch (Exception ex)
                     {
-                        // If product uses connected options (option values linked to metafields), Shopify blocks creating new option values
                         if (ex.Message.IndexOf("option value linked to a metafield", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
                             blockNewVariantCreation = true;
-
                             Console.WriteLine("SKIP creating new variant (connected options): SKU " + turum.sku + " size " + size + " productId " + productId);
                             continue;
                         }
@@ -903,7 +1099,43 @@ namespace HSH.TurumShopifySync
                 }
             }
 
-            // Optional: for Shopify variants not present in Turum -> inventory set to 0 will happen in SetInventoryFromTurumAsync
+            // Second pass: set positions for created variants (do this in desired order)
+            if (createdVariants.Count > 0)
+            {
+                Console.WriteLine("[INFO] Created " + createdVariants.Count + " variants. Starting position updates. SKU " + turum.sku + " productId " + productId);
+
+                // Map created size -> id for quick lookup
+                var createdMap = createdVariants.ToDictionary(x => x.size, x => x.variantId, StringComparer.OrdinalIgnoreCase);
+
+                int desiredPos = 1;
+                foreach (var s in desiredSizes)
+                {
+                    if (createdMap.TryGetValue(s, out var vid))
+                    {
+                        Console.WriteLine("Setting position for created variant SKU " + turum.sku + " size " + s + " to " + desiredPos);
+                        try
+                        {
+                            var posPayload = new
+                            {
+                                variant = new
+                                {
+                                    id = vid,
+                                    position = desiredPos
+                                }
+                            };
+
+                            await ShopifyPutAsync<dynamic>(shopify, "variants/" + vid + ".json", posPayload, d => d, ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Non-fatal: log and continue. Caller still has a fallback reorder step.
+                            Console.WriteLine("[WARN] Failed to set variant position for created variant " + vid + " product " + productId + " size " + s + " : " + ex.Message);
+                        }
+                    }
+
+                    desiredPos++;
+                }
+            }
 
             return createdAny;
         }
@@ -1272,7 +1504,7 @@ namespace HSH.TurumShopifySync
                 product = new
                 {
                     title = p.name,
-                    vendor = "TURUM B2B", // set the vendor to TURUM
+                    vendor = p.brand,
                     product_type = productType,
                     status = "active",
                     tags = string.Join(", ", tags),
@@ -1296,7 +1528,7 @@ namespace HSH.TurumShopifySync
                 {
                     id = productId,
                     title = p.name,
-                    vendor = "TURUM B2B",
+                    vendor = p.brand,
                     product_type = category,
                     tags = mergedTags
                 }
@@ -1534,15 +1766,83 @@ namespace HSH.TurumShopifySync
 
         private static async Task ReplaceProductImagesAsync(HttpClient shopify, long productId, string imageUrl, string alt, CancellationToken ct)
         {
+            /*
+             PSEUDOCODE / PLAN (detailed):
+             1. If imageUrl is null/empty/whitespace:
+                - Log that there is no image URL.
+                - Attempt to archive the Shopify product by sending a PUT to "products/{id}.json" with status = "archived".
+                - If archiving fails, log a warning but do not throw (non-fatal).
+                - Return.
+             2. Trim the imageUrl.
+             3. Validate the image URL via IsValidImageUrlAsync.
+                - If validation fails:
+                  - Log that the image is invalid.
+                  - Attempt to archive the Shopify product as in step 1.
+                  - Return.
+             4. If validation succeeds:
+                - Fetch current product images (id, src).
+                - If there are no images:
+                  - Try to create the image via POST to "products/{id}/images.json".
+                  - Handle Shopify rejecting the image by checking exception message for "Image URL is invalid" and log+return.
+                - If there is at least one image:
+                  - Compare first image src to new imageUrl; if equal, return (no-op).
+                  - Otherwise update the first image via PUT to "products/{id}/images/{imageId}.json".
+                  - On Shopify image rejection, log and return.
+             Notes:
+             - Archiving should not throw the whole sync; failures are logged and treated as non-fatal.
+             - Use existing helper ShopifyPutAsync and ShopifyPostAsync/ShopifyGetAsync.
+            */
+
             if (string.IsNullOrWhiteSpace(imageUrl))
+            {
+                Console.WriteLine("SKIP image update (no image url). Archiving product " + productId);
+                try
+                {
+                    var archivePayload = new
+                    {
+                        product = new
+                        {
+                            id = productId,
+                            status = "archived"
+                        }
+                    };
+
+                    await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json", archivePayload, d => d, ct);
+                    Console.WriteLine("[INFO] Archived product " + productId + " due to missing image.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[WARN] Failed to archive product " + productId + ": " + ex.Message);
+                }
+
                 return;
+            }
 
             imageUrl = imageUrl.Trim();
 
             var ok = await IsValidImageUrlAsync(imageUrl, ct);
             if (!ok)
             {
-                Console.WriteLine("SKIP image update: " + imageUrl);
+                Console.WriteLine("SKIP image update (invalid image url). Archiving product " + productId + " url " + imageUrl);
+                try
+                {
+                    var archivePayload = new
+                    {
+                        product = new
+                        {
+                            id = productId,
+                            status = "archived"
+                        }
+                    };
+
+                    await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json", archivePayload, d => d, ct);
+                    Console.WriteLine("[INFO] Archived product " + productId + " due to invalid image URL.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[WARN] Failed to archive product " + productId + ": " + ex.Message);
+                }
+
                 return;
             }
 
@@ -2481,6 +2781,135 @@ namespace HSH.TurumShopifySync
                 request.Headers.Remove("X-Shopify-Access-Token");
 
             request.Headers.Add("X-Shopify-Access-Token", token);
+
+            return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+
+
+    // ==========================
+    // Turum Token Refresh logic
+    // ==========================
+
+    public sealed class TurumTokenProvider
+    {
+        private readonly string _username;
+        private readonly string _password;
+        private readonly HttpClient _http = new HttpClient();
+        private readonly SemaphoreSlim _mutex = new SemaphoreSlim(1, 1);
+
+        private string _accessToken;
+        private DateTime _expiresAtUtc = DateTime.MinValue;
+
+        public TurumTokenProvider(string username, string password)
+        {
+            _username = username ?? throw new ArgumentNullException(nameof(username));
+            _password = password ?? throw new ArgumentNullException(nameof(password));
+        }
+
+        public async Task<string> GetAccessTokenAsync(CancellationToken ct = default)
+        {
+            await _mutex.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(_accessToken) &&
+                    DateTime.UtcNow < _expiresAtUtc - TimeSpan.FromMinutes(5))
+                {
+                    return _accessToken;
+                }
+
+                var url = "https://api.b2b.turum.pl/v1/account/login";
+                using (var req = new HttpRequestMessage(HttpMethod.Post, url))
+                {
+                    var body = new
+                    {
+                        username = _username,
+                        password = _password
+                    };
+
+                    req.Content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+                    req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                    using (var resp = await _http.SendAsync(req, ct).ConfigureAwait(false))
+                    {
+                        resp.EnsureSuccessStatusCode();
+                        var json = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                        string token = null;
+                        int expiresIn = 0;
+
+                        try
+                        {
+                            var obj = JsonConvert.DeserializeObject<JObject>(json);
+                            if (obj != null)
+                            {
+                                token = obj.Value<string>("token")
+                                        ?? obj.Value<string>("access_token")
+                                        ?? obj.Value<string>("jwt")
+                                        ?? obj.Value<string>("accessToken");
+
+                                if (string.IsNullOrWhiteSpace(token) && obj["data"] != null)
+                                {
+                                    var data = obj["data"] as JObject;
+                                    if (data != null)
+                                    {
+                                        token = data.Value<string>("token")
+                                            ?? data.Value<string>("access_token")
+                                            ?? data.Value<string>("jwt")
+                                            ?? data.Value<string>("accessToken");
+                                    }
+                                }
+
+                                if (obj["expires_in"] != null)
+                                    int.TryParse(obj["expires_in"].ToString(), out expiresIn);
+                            }
+                        }
+                        catch
+                        {
+                            // ignore parse errors below - try raw token fallback
+                        }
+
+                        if (string.IsNullOrWhiteSpace(token))
+                            token = json?.Trim().Trim('"');
+
+                        if (string.IsNullOrWhiteSpace(token))
+                            throw new Exception("Failed to obtain Turum token. Response: " + json);
+
+                        _accessToken = token;
+                        if (expiresIn > 0)
+                            _expiresAtUtc = DateTime.UtcNow.AddSeconds(expiresIn);
+                        else
+                            _expiresAtUtc = DateTime.UtcNow.AddHours(23);
+
+                        return _accessToken;
+                    }
+                }
+            }
+            finally
+            {
+                _mutex.Release();
+            }
+        }
+    }
+
+    public sealed class TurumTokenRefreshHandler : DelegatingHandler
+    {
+        private readonly TurumTokenProvider _provider;
+
+        public TurumTokenRefreshHandler(TurumTokenProvider provider)
+        {
+            _provider = provider ?? throw new ArgumentNullException(nameof(provider));
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var token = await _provider.GetAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+
+            if (request.Headers.Authorization != null)
+                request.Headers.Authorization = null;
+
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
             return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
         }
