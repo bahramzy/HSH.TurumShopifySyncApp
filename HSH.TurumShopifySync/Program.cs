@@ -176,7 +176,7 @@ namespace HSH.TurumShopifySync
                 int total = turumProducts.Count;
                 int processed = 0;
 
-                foreach (var p in turumProducts.AsEnumerable().Reverse())
+                foreach (var p in turumProducts.AsEnumerable())
                 {
                     try
                     {
@@ -1037,11 +1037,11 @@ namespace HSH.TurumShopifySync
                         var resp = await ShopifyPostAsync<dynamic>(shopify, "products/" + productId + "/variants.json", payload, doc => doc, ct);
 
                         // Log full create response for debugging
-                        try
-                        {
-                            Console.WriteLine("[DEBUG] Variant create response: " + JsonConvert.SerializeObject(resp));
-                        }
-                        catch { /* ignore logging errors */ }
+                        //try
+                        //{
+                        //    Console.WriteLine("[DEBUG] Variant create response: " + JsonConvert.SerializeObject(resp));
+                        //}
+                        //catch { /* ignore logging errors */ }
 
                         long createdVariantId = 0;
                         try { createdVariantId = ToLong(resp.variant.id); } catch { createdVariantId = 0; }
@@ -1054,29 +1054,29 @@ namespace HSH.TurumShopifySync
                             Console.WriteLine("CREATED variant SKU " + turum.sku + " size " + size + " productId " + productId + " variantId " + createdVariantId);
 
                             // Verify variant exists server-side (same store/token)
-                            try
-                            {
-                                dynamic vdoc = await ShopifyGetAsync<dynamic>(shopify, "variants/" + createdVariantId + ".json", ct);
-                                Console.WriteLine("[DEBUG] Fetched created variant " + createdVariantId + ": " + JsonConvert.SerializeObject(vdoc));
-                            }
-                            catch (Exception ex)
-                            {
-                                // 404 or other errors — surface for debugging
-                                Console.WriteLine("[WARN] Fetching created variant " + createdVariantId + " failed: " + ex.Message);
-                                Console.WriteLine("[WARN] You should inspect the POST response above and ensure Postman uses the same store/token and API version.");
-                            }
+                            //try
+                            //{
+                            //    dynamic vdoc = await ShopifyGetAsync<dynamic>(shopify, "variants/" + createdVariantId + ".json", ct);
+                            //    Console.WriteLine("[DEBUG] Fetched created variant " + createdVariantId + ": " + JsonConvert.SerializeObject(vdoc));
+                            //}
+                            //catch (Exception ex)
+                            //{
+                            //    // 404 or other errors — surface for debugging
+                            //    Console.WriteLine("[WARN] Fetching created variant " + createdVariantId + " failed: " + ex.Message);
+                            //    Console.WriteLine("[WARN] You should inspect the POST response above and ensure Postman uses the same store/token and API version.");
+                            //}
 
                             // Fetch product to inspect options & variant list
-                            try
-                            {
-                                dynamic pdoc = await ShopifyGetAsync<dynamic>(shopify, "products/" + productId + ".json?fields=variants,options", ct);
-                                Console.WriteLine("[DEBUG] Product variants after create: " + JsonConvert.SerializeObject(pdoc.product.variants));
-                                Console.WriteLine("[DEBUG] Product options after create: " + JsonConvert.SerializeObject(pdoc.product.options));
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine("[WARN] Failed to fetch product after variant create: " + ex.Message);
-                            }
+                            //try
+                            //{
+                            //    dynamic pdoc = await ShopifyGetAsync<dynamic>(shopify, "products/" + productId + ".json?fields=variants,options", ct);
+                            //    Console.WriteLine("[DEBUG] Product variants after create: " + JsonConvert.SerializeObject(pdoc.product.variants));
+                            //    Console.WriteLine("[DEBUG] Product options after create: " + JsonConvert.SerializeObject(pdoc.product.options));
+                            //}
+                            //catch (Exception ex)
+                            //{
+                            //    Console.WriteLine("[WARN] Failed to fetch product after variant create: " + ex.Message);
+                            //}
                         }
                         else
                         {
