@@ -27,7 +27,7 @@ namespace HSH.TurumShopifySync
         private const string ShopifyApiVersion = "2026-01"; // "latest" in REST docs at the moment
         private const decimal EurToDkkRate = 7.47m;         // TODO: replace with real FX later
         private const decimal MomsRate = 1.25m;
-        private const decimal Profit = 275m;                // DKK profit per item
+        private const decimal Profit = 325m;                // DKK profit per item
         private const string ShopifySneakersCategoryId = "gid://shopify/TaxonomyCategory/aa-8-8"; // TODO set actual. A constant for the Sneakers taxonomy category ID
 
         // Image-checking HttpClient
@@ -38,8 +38,8 @@ namespace HSH.TurumShopifySync
 
         private static bool EqualsIgnoreCase(string a, string b) => string.Equals((a ?? "").Trim(), (b ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
 
-        private static readonly string ShopifyAdminToken = "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"; //Environment.GetEnvironmentVariable("SHOPIFY_ADMIN_TOKEN");
-        private static readonly string TurumToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoaWdoc3RyZWV0aGVhdmVuMjRAZ21haWwuY29tIiwicm9sZSI6InR1cnVtX2N1c3RvbWVyIiwiZXhwIjoxNzcxMTUyOTc1fQ.12WsPrft2n7IenuAK8kV7y-YoTK553bBTuIKcxR39XI";//Environment.GetEnvironmentVariable("TURUM_TOKEN");
+        private static readonly string ShopifyAdminToken = "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"; //Environment.GetEnvironmentVariable("SHOPIFY_ADMIN_TOKEN");
+        private static readonly string TurumToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJoaWdoc3RyZWV0aGVhdmVuMjRAZ21haWwuY29tIiwicm9sZSI6InR1cnVtX2N1c3RvbWVyIiwiZXhwIjoxNzcyNDkxNzc1fQ.yFjpkegYVF7tKrx1NNPjRAURMwIll000uTUK6XmgSqE";//Environment.GetEnvironmentVariable("TURUM_TOKEN");
 
         private static void Main(string[] args)
         {
@@ -328,7 +328,7 @@ namespace HSH.TurumShopifySync
                         //var shopifyProduct = existingProductDoc ?? await GetShopifyProductAsync(shopifyHttp, productId, ct);
                         var shopifyProduct = existingProductDoc ?? await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
 
-                        // Upsert variants (by size) + inventory set
+                        // Upsert variants (by size)
                         var variantsCreated = await UpsertVariantsBySizeAsync(shopifyHttp, productId, shopifyProduct, p, ct);
 
                         // Refresh (if new variants were created)
@@ -922,6 +922,7 @@ namespace HSH.TurumShopifySync
             var seenSizes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             // Collect existing variants and sizes
+            // Shopify product variants - size -> variant object dictionary
             try
             {
                 foreach (var sv in shopifyProductDoc.product.variants)
@@ -1135,6 +1136,46 @@ namespace HSH.TurumShopifySync
 
                     desiredPos++;
                 }
+            }
+
+            // Remove Shopify variants that are not present in Turum anymore.
+            // Keep variants that have special barcodes (e.g. "HSH") as a safety.
+            try
+            {
+                var turumSet = new HashSet<string>(turumSizes, StringComparer.OrdinalIgnoreCase);
+
+                foreach (var kv in existingBySize)
+                {
+                    var size = kv.Key;
+                    // If Turum still has this size, keep it
+                    if (turumSet.Contains(size))
+                        continue;
+
+                    dynamic sv = kv.Value;
+                    var barcode = ((string)sv.barcode ?? "").Trim();
+
+                    // Preserve HSH-marked variants (or any other special barcode)
+                    if (string.Equals(barcode, "HSH", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    long variantId = ToLong(sv.id);
+                    if (variantId <= 0) continue;
+
+                    try
+                    {
+                        await ShopifyDeleteAsync(shopify, "variants/" + variantId + ".json", ct);
+                        Console.WriteLine("[INFO] Deleted Shopify-only variant size " + size + " variantId " + variantId + " for product " + productId);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("[WARN] Failed to delete variant " + variantId + ": " + ex.Message);
+                        // non-fatal — continue
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[WARN] Cleanup extra variants failed: " + ex.Message);
             }
 
             return createdAny;
