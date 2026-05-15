@@ -27,7 +27,7 @@ namespace HSH.TurumShopifySync
         private const string ShopifyApiVersion = "2026-01"; // "latest" in REST docs at the moment
         private const decimal EurToDkkRate = 7.47m;         // TODO: replace with real FX later
         private const decimal MomsRate = 1.25m;
-        private const decimal Profit = 325m;                // DKK profit per item
+        private const decimal Profit = 375m;                // DKK profit per item
         private const string ShopifySneakersCategoryId = "gid://shopify/TaxonomyCategory/aa-8-8"; // TODO set actual. A constant for the Sneakers taxonomy category ID
 
         // Image-checking HttpClient
