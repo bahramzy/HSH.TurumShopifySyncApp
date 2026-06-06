@@ -2,7 +2,8 @@ name: Daily Run
 
 on:
   schedule:
-    - cron: '0 0 * * *'    # once a day at midnight (new)
+    - cron: '0 0 * * *'    # once a day at midnight
+  workflow_dispatch:
 jobs:
   run:
     runs-on: windows-latest  # changed from ubuntu-latest
