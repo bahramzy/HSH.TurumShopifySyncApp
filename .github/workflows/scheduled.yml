@@ -1,4 +1,4 @@
-name: Hourly Run
+name: Daily Run
 
 on:
   schedule:
