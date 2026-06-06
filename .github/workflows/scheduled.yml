@@ -1,0 +1,22 @@
+name: Hourly Run
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # every hour
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35  # just above your max run time
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'  # change to your version
+
+      - name: Run app
+        run: dotnet run --project ./YourApp  # adjust path to your project
+        env:
+          MY_API_KEY: ${{ secrets.MY_API_KEY }}  # repeat for each secret
