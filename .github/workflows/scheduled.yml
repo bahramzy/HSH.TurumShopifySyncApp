@@ -24,4 +24,7 @@ jobs:
       - name: Run app
         run: ./HSH.TurumShopifySync/bin/Release/HSH.TurumShopifySync.exe
         env:
-          MY_API_KEY: ${{ secrets.MY_API_KEY }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          TURUM_PASSWORD: ${{ secrets.TURUM_PASSWORD }}
+          TURUM_USERNAME: ${{ secrets.TURUM_USERNAME }}
