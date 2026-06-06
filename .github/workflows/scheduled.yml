@@ -12,7 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore packages
+        run: dotnet restore ./HSH.TurumShopifySync/HSH.TurumShopifySync.csproj
+
       - name: Run app
-        run: dotnet run --project ./HSH.TurumShopifySync  # adjust path
+        run: dotnet run --project ./HSH.TurumShopifySync
         env:
           MY_API_KEY: ${{ secrets.MY_API_KEY }}
