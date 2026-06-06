@@ -2,8 +2,7 @@ name: Hourly Run
 
 on:
   schedule:
-    - cron: '0 * * * *'
-
+    - cron: '0 0 * * *'    # once a day at midnight (new)
 jobs:
   run:
     runs-on: windows-latest  # changed from ubuntu-latest
