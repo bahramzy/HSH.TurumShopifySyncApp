@@ -16,7 +16,7 @@ jobs:
         uses: nuget/setup-nuget@v2
 
       - name: Restore packages
-        run: nuget restore ./HSH.TurumShopifySync.sln
+        run: nuget restore ./HSH.TurumShopifySyncApp.sln
 
       - name: Build app
         run: dotnet build ./HSH.TurumShopifySync/HSH.TurumShopifySync.csproj --configuration Release
