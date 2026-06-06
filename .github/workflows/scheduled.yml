@@ -22,6 +22,6 @@ jobs:
         run: dotnet build ./HSH.TurumShopifySync/HSH.TurumShopifySync.csproj --configuration Release
 
       - name: Run app
-        run: dotnet run --project ./HSH.TurumShopifySync --configuration Release
+        run: ./HSH.TurumShopifySync/bin/Release/HSH.TurumShopifySync.exe
         env:
           MY_API_KEY: ${{ secrets.MY_API_KEY }}
