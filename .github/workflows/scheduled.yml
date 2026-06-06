@@ -12,10 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install NuGet
+        uses: nuget/setup-nuget@v2
+
       - name: Restore packages
-        run: dotnet restore ./HSH.TurumShopifySync/HSH.TurumShopifySync.csproj
+        run: nuget restore ./HSH.TurumShopifySync/HSH.TurumShopifySync.csproj
+
+      - name: Build app
+        run: dotnet build ./HSH.TurumShopifySync/HSH.TurumShopifySync.csproj --configuration Release
 
       - name: Run app
-        run: dotnet run --project ./HSH.TurumShopifySync
+        run: dotnet run --project ./HSH.TurumShopifySync --configuration Release
         env:
           MY_API_KEY: ${{ secrets.MY_API_KEY }}
