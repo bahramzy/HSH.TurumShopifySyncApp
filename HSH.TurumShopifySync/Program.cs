@@ -329,10 +329,10 @@ namespace HSH.TurumShopifySync
                         var shopifyProduct = existingProductDoc ?? await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
 
                         // Upsert variants (by size)
-                        var variantsCreated = await UpsertVariantsBySizeAsync(shopifyHttp, productId, shopifyProduct, p, ct);
+                        var variantsChanged = await UpsertVariantsBySizeAsync(shopifyHttp, productId, shopifyProduct, p, ct);
 
-                        // Refresh (if new variants were created)
-                        if (variantsCreated)
+                        // Refresh if variants were created or deleted.
+                        if (variantsChanged)
                         {
                             //shopifyProduct = await GetShopifyProductAsync(shopifyHttp, productId, ct);
                             shopifyProduct = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
@@ -913,6 +913,7 @@ namespace HSH.TurumShopifySync
         private static async Task<bool> UpsertVariantsBySizeAsync(HttpClient shopify, long productId, dynamic shopifyProductDoc, TurumProduct turum, CancellationToken ct)
         {
             bool createdAny = false;
+            bool deletedAny = false;
 
             // existingBySize: option1 -> variant object
             var existingBySize = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
@@ -1164,6 +1165,7 @@ namespace HSH.TurumShopifySync
                     try
                     {
                         await ShopifyDeleteAsync(shopify, "variants/" + variantId + ".json", ct);
+                        deletedAny = true;
                         Console.WriteLine("[INFO] Deleted Shopify-only variant size " + size + " variantId " + variantId + " for product " + productId);
                     }
                     catch (Exception ex)
@@ -1178,7 +1180,7 @@ namespace HSH.TurumShopifySync
                 Console.WriteLine("[WARN] Cleanup extra variants failed: " + ex.Message);
             }
 
-            return createdAny;
+            return createdAny || deletedAny;
         }
 
         private static async Task EnsureVariantPositionsBySizeAsync(HttpClient shopify, long productId, dynamic shopifyProductDoc, CancellationToken ct)
