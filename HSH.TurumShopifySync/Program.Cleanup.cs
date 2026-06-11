@@ -91,13 +91,7 @@ namespace HSH.TurumShopifySync
 
                 // Need: tags + variants(id,barcode)
 
-                dynamic productDoc = await ShopifyGetAsync<dynamic>(
-
-                    shopify,
-
-                    "products/" + productId + ".json?fields=id,title,vendor,tags,variants",
-
-                    ct);
+                dynamic productDoc = await GetShopifyProductGraphQlAsync(shopify, productId, ct);
 
 
 
@@ -205,7 +199,7 @@ namespace HSH.TurumShopifySync
 
 
 
-                            await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json", updatePayload, d => d, ct);
+                            await UpdateShopifyProductTagsGraphQlAsync(shopify, productId, newTagsCsv, ct);
 
                             Console.WriteLine("[INFO] Removed TURUM tag from productId " + productId + " SKU " + sku + " NewTags: " + newTagsCsv);
 
@@ -222,44 +216,7 @@ namespace HSH.TurumShopifySync
                         // Non-fatal: continue sync
 
                     }
-
-
-
-                    // Set vendor to Highstreet Heaven, now that it's no longer Turum
-
-                    //await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json",
-
-                    //    new
-
-                    //    {
-
-                    //        product = new
-
-                    //        {
-
-                    //            id = productId,
-
-                    //            vendor = "Highstreet Heaven" // we use vendor for the brand of the product
-
-                    //        }
-
-                    //    },
-
-                    //    d => d,
-
-                    //    ct);
-
-
-
-                    // Remove tag TURUM
-
-
-
-
-
-
-
-                    continue;
+continue;
 
                 }
 
@@ -268,28 +225,7 @@ namespace HSH.TurumShopifySync
                 // Otherwise archive the product
 
                 Console.WriteLine("[WARN] ARCHIVE missing in Turum (no HSH variants). SKU " + sku + " productId " + productId);
-
-
-
-                var archivePayload = new
-
-                {
-
-                    product = new
-
-                    {
-
-                        id = productId,
-
-                        status = "archived"
-
-                    }
-
-                };
-
-
-
-                await ShopifyPutAsync<dynamic>(shopify, "products/" + productId + ".json", archivePayload, d => d, ct);
+                await SetShopifyProductStatusGraphQlAsync(shopify, productId, "ARCHIVED", ct);
 
                 archivedCount++;
 
@@ -385,9 +321,7 @@ namespace HSH.TurumShopifySync
 
 
 
-                // DELETE /variants/{id}.json
-
-                await ShopifyDeleteAsync(shopify, "variants/" + variantId + ".json", ct);
+                await DeleteVariantGraphQlAsync(shopify, ToLong(productDoc.product.id), variantId, ct);
 
                 deleted++;
 

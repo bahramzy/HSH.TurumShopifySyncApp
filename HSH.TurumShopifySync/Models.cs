@@ -7,6 +7,7 @@ namespace HSH.TurumShopifySync
     {
         public Dictionary<string, long> Active = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, long> Archived = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<long, dynamic> ProductsById = new Dictionary<long, dynamic>();
     }
 
     // ==========================

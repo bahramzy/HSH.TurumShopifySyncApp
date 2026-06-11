@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -89,23 +90,47 @@ namespace HSH.TurumShopifySync
             using (turumHttp)
             using (shopifyHttp) // created above with possible token provider
             {
-                var locationId = await GetFirstShopifyLocationIdAsync(shopifyHttp, ct);
+                var locationId = await WithBusyIndicatorAsync(
+                    "Getting Shopify location",
+                    () => GetFirstShopifyLocationIdAsync(shopifyHttp, ct),
+                    ct);
                 Console.WriteLine("Using Shopify location ID: " + locationId);
 
                 // Build SKU -> productId map (paged)
-                var skuIndexes = await BuildShopifySkuIndexesAsync(shopifyHttp, ct);
+                var shopifyIndexTimer = Stopwatch.StartNew();
+                var skuIndexes = await WithBusyIndicatorAsync(
+                    "Indexing Shopify SKUs",
+                    () => BuildShopifySkuIndexesAsync(shopifyHttp, ct),
+                    ct);
+                shopifyIndexTimer.Stop();
                 var activeSkuIndex = skuIndexes.Active;
                 var archivedSkuIndex = skuIndexes.Archived;
-                Console.WriteLine("Indexed SKUs from Shopify: Active=" + activeSkuIndex.Count + " Archived=" + archivedSkuIndex.Count);
+                var shopifyProductsById = skuIndexes.ProductsById;
+                Console.WriteLine("Indexed SKUs from Shopify: Active=" + activeSkuIndex.Count + " Archived=" + archivedSkuIndex.Count + " Products=" + shopifyProductsById.Count);
+                Console.WriteLine("Shopify SKU index elapsed: " + shopifyIndexTimer.Elapsed.ToString(@"hh\:mm\:ss\.fff"));
 
                 // Fetch Turum products
-                var turumProducts = await FetchTurumProductsAsync(turumHttp, ct);
+                var turumProducts = await WithBusyIndicatorAsync(
+                    "Fetching Turum products",
+                    () => FetchTurumProductsAsync(turumHttp, ct),
+                    ct);
                 Console.WriteLine("Fetched TURUM products: " + turumProducts.Count);
 
                 int created = 0, updated = 0;
 
                 int total = turumProducts.Count;
                 int processed = 0;
+                var mainLoopTimer = Stopwatch.StartNew();
+                var productFetchTimer = TimeSpan.Zero;
+                var imageTimer = TimeSpan.Zero;
+                var productUpdateTimer = TimeSpan.Zero;
+                var variantTimer = TimeSpan.Zero;
+                var variantRefreshTimer = TimeSpan.Zero;
+                var reorderTimer = TimeSpan.Zero;
+                var inventoryTimer = TimeSpan.Zero;
+                int liveProductFetches = 0;
+                int variantRefreshes = 0;
+                int reorderCount = 0;
 
                 foreach (var p in turumProducts.AsEnumerable())
                 {
@@ -123,14 +148,19 @@ namespace HSH.TurumShopifySync
                         // Category detection (for tags + product_type)
                         var category = DetectTurumCategory(p);
 
-                        // Check image URL
-                        var includeImage = await IsValidImageUrlAsync(p.image, ct);
+                        bool? includeImage = null;
 
                         // Check if SKU already exists
                         if (activeSkuIndex.TryGetValue(p.sku, out productId))
                         {
-                            //existingProductDoc = await GetShopifyProductAsync(shopifyHttp, productId, ct);
-                            existingProductDoc = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                            if (!shopifyProductsById.TryGetValue(productId, out existingProductDoc))
+                            {
+                                var opTimer = Stopwatch.StartNew();
+                                existingProductDoc = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                                opTimer.Stop();
+                                productFetchTimer += opTimer.Elapsed;
+                                liveProductFetches++;
+                            }
 
                             // NEW RULE: if tagged "PO" → force new product
                             if (HasTag(existingProductDoc, "PO"))
@@ -138,8 +168,10 @@ namespace HSH.TurumShopifySync
                         }
                         else if (archivedSkuIndex.TryGetValue(p.sku, out productId))
                         {
+                            includeImage = await IsValidImageUrlAsync(p.image, ct);
+
                             // Unarchive only if the image is valid. Skip otherwise.
-                            if (!includeImage)
+                            if (includeImage != true)
                             {
                                 Console.WriteLine("[WARN] SKU " + p.sku + " exists but archived, and image URL is invalid. Keep it archived and skip. SKU " + p.sku + " url " + p.image);
                                 continue;
@@ -148,24 +180,21 @@ namespace HSH.TurumShopifySync
                             Console.WriteLine("[INFO] SKU " + p.sku + " exists but archived. Unarchive and treat as update.");
 
                             // Unarchive the product first
-                            var unarchivePayload = new
-                            {
-                                product = new
-                                {
-                                    id = productId,
-                                    status = "active"
-                                }
-                            };
-
-                            await ShopifyPutAsync<dynamic>(shopifyHttp, "products/" + productId + ".json", unarchivePayload, d => d, ct);
+                            await SetShopifyProductStatusGraphQlAsync(shopifyHttp, productId, "ACTIVE", ct);
 
                             // Move it from archived index to active index
                             archivedSkuIndex.Remove(p.sku);
                             activeSkuIndex[p.sku] = productId;
 
                             // Continue with update flow (fetch product from shopify)
-                            //existingProductDoc = await GetShopifyProductAsync(shopifyHttp, productId, ct);
-                            existingProductDoc = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                            if (!shopifyProductsById.TryGetValue(productId, out existingProductDoc))
+                            {
+                                var opTimer = Stopwatch.StartNew();
+                                existingProductDoc = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                                opTimer.Stop();
+                                productFetchTimer += opTimer.Elapsed;
+                                liveProductFetches++;
+                            }
                         }
 
                         if (!activeSkuIndex.ContainsKey(p.sku) || mustCreateNewBecausePo)
@@ -174,18 +203,19 @@ namespace HSH.TurumShopifySync
                             // CREATE PRODUCT
                             // ======================
 
+                            if (!includeImage.HasValue)
+                                includeImage = await IsValidImageUrlAsync(p.image, ct);
+
                             // Skip if the image is invalid
-                            if (!includeImage)
+                            if (includeImage != true)
                             {
                                 Console.WriteLine("[WARN] Invalid image URL, Skip product creation. SKU " + p.sku + " url " + p.image);
                                 continue;
                             }
 
-                            var createPayload = BuildShopifyCreateProductPayload(p, includeImage, category);
-
                             try
                             {
-                                productId = await ShopifyPostAsync<long>(shopifyHttp, "products.json", createPayload, doc => (long)doc.product.id, ct);
+                                productId = await CreateShopifyProductGraphQlAsync(shopifyHttp, p, includeImage.Value, category, ct);
                             }
                             catch (Exception ex)
                             {
@@ -195,8 +225,7 @@ namespace HSH.TurumShopifySync
                                     Console.WriteLine("[WARN] CREATE without image (invalid url). SKU " + p.sku + " url " + p.image);
 
                                     // retry without images
-                                    var payloadNoImage = BuildShopifyCreateProductPayload(p, false, category);
-                                    productId = await ShopifyPostAsync<long>(shopifyHttp, "products.json", payloadNoImage, d => (long)d.product.id, ct);
+                                    productId = await CreateShopifyProductGraphQlAsync(shopifyHttp, p, false, category, ct);
                                 }
                                 else
                                 {
@@ -207,7 +236,7 @@ namespace HSH.TurumShopifySync
                             // If category is Sneakers, and add to Sneakers collection
                             if (category == "Sneakers")
                             {
-                                // Set category to Sneakers (via GraphSQL API)
+                                // Set category to Sneakers (via GraphQL API)
                                 await SetShopifyCategorySneakersAsync(shopifyHttp, productId, ct);
 
                                 // Add to Sneakers collection
@@ -231,7 +260,10 @@ namespace HSH.TurumShopifySync
                             // ======================
 
                             // Update image
-                            await ReplaceProductImagesAsync(shopifyHttp, productId, p.image, p.name, ct);
+                            var opTimer = Stopwatch.StartNew();
+                            await ReplaceProductImagesAsync(shopifyHttp, productId, p.image, p.name, existingProductDoc, ct);
+                            opTimer.Stop();
+                            imageTimer += opTimer.Elapsed;
 
                             // CLEANUP and merge tags
                             string mergedTags = TagsMergeAndCleanUp(existingProductDoc, p, category);
@@ -239,9 +271,10 @@ namespace HSH.TurumShopifySync
                             var needsProductUpdate = ProductUpdateNeeded(existingProductDoc, p.name, p.brand, category, mergedTags);
                             if (needsProductUpdate)
                             {
-                                var updatePayload = BuildShopifyUpdateProductPayload(productId, p, mergedTags, category);
-
-                                await ShopifyPutAsync<dynamic>(shopifyHttp, "products/" + productId + ".json", updatePayload, d => d, ct);
+                                opTimer = Stopwatch.StartNew();
+                                await UpdateShopifyProductGraphQlAsync(shopifyHttp, productId, p, mergedTags, category, ct);
+                                opTimer.Stop();
+                                productUpdateTimer += opTimer.Elapsed;
 
                                 updated++;
                                 Console.WriteLine("UPDATED SKU " + p.sku + " -> product " + productId);
@@ -256,27 +289,45 @@ namespace HSH.TurumShopifySync
                         }
 
                         // Always fetch product to get variants + inventory_item_id
-                        //var shopifyProduct = existingProductDoc ?? await GetShopifyProductAsync(shopifyHttp, productId, ct);
-                        var shopifyProduct = existingProductDoc ?? await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                        dynamic shopifyProduct = existingProductDoc;
+                        if (shopifyProduct == null)
+                        {
+                            var opTimer = Stopwatch.StartNew();
+                            shopifyProduct = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                            opTimer.Stop();
+                            productFetchTimer += opTimer.Elapsed;
+                            liveProductFetches++;
+                        }
 
                         // Upsert variants (by size)
-                        var variantsChanged = await UpsertVariantsBySizeAsync(shopifyHttp, productId, shopifyProduct, p, ct);
-
-                        // Refresh if variants were created or deleted.
-                        if (variantsChanged)
                         {
-                            //shopifyProduct = await GetShopifyProductAsync(shopifyHttp, productId, ct);
-                            shopifyProduct = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                            var opTimer = Stopwatch.StartNew();
+                            var variantsChanged = await UpsertVariantsBySizeAsync(shopifyHttp, productId, shopifyProduct, p, ct);
+                            opTimer.Stop();
+                            variantTimer += opTimer.Elapsed;
+
+                            // Refresh if variants were created or deleted.
+                            if (variantsChanged)
+                            {
+                                opTimer = Stopwatch.StartNew();
+                                shopifyProduct = await GetShopifyProductGraphQlAsync(shopifyHttp, productId, ct);
+                                opTimer.Stop();
+                                variantRefreshTimer += opTimer.Elapsed;
+                                variantRefreshes++;
+                            }
                         }
 
                         // Reorder variants if we need to
                         if (VariantReorderNeeded(shopifyProduct))
                         {
                             Console.WriteLine("[INFO] Reordering variants needed. SKU " + p.sku);
+                            var opTimer = Stopwatch.StartNew();
                             await EnsureVariantPositionsBySizeAsync(shopifyHttp, productId, shopifyProduct, ct);
+                            opTimer.Stop();
+                            reorderTimer += opTimer.Elapsed;
+                            reorderCount++;
 
                             // Optional: refresh if you rely on correct positions later (usually not needed)
-                            // shopifyProduct = await GetShopifyProductAsync(shopifyHttp, productId, ct);
                         }
                         else
                         {
@@ -284,7 +335,12 @@ namespace HSH.TurumShopifySync
                         }
 
                         // Inventory
-                        await SetInventoryFromTurumAsync(shopifyHttp, locationId, shopifyProduct, p, ct);
+                        {
+                            var opTimer = Stopwatch.StartNew();
+                            await SetInventoryFromTurumAsync(shopifyHttp, locationId, shopifyProduct, p, ct);
+                            opTimer.Stop();
+                            inventoryTimer += opTimer.Elapsed;
+                        }
                     }
                     finally
                     {
@@ -299,13 +355,25 @@ namespace HSH.TurumShopifySync
                     }
                 }
 
+                mainLoopTimer.Stop();
+                Console.WriteLine("Main product loop elapsed: " + mainLoopTimer.Elapsed.ToString(@"hh\:mm\:ss\.fff"));
+                Console.WriteLine("Performance profile: ProductFetch=" + productFetchTimer.ToString(@"hh\:mm\:ss\.fff") +
+                                  " (" + liveProductFetches + " calls), Image=" + imageTimer.ToString(@"hh\:mm\:ss\.fff") +
+                                  ", ProductUpdate=" + productUpdateTimer.ToString(@"hh\:mm\:ss\.fff") +
+                                  ", Variants=" + variantTimer.ToString(@"hh\:mm\:ss\.fff") +
+                                  ", VariantRefresh=" + variantRefreshTimer.ToString(@"hh\:mm\:ss\.fff") +
+                                  " (" + variantRefreshes + " calls), Reorder=" + reorderTimer.ToString(@"hh\:mm\:ss\.fff") +
+                                  " (" + reorderCount + " calls), Inventory=" + inventoryTimer.ToString(@"hh\:mm\:ss\.fff"));
                 Console.WriteLine("Done. Created: " + created + ", Updated: " + updated);
 
                 // Remove products from Shopify that are no longer in Turum
                 // After main sync loop:
                 Console.WriteLine();
                 Console.WriteLine("[INFO] Starting cleanup of missing Turum products...");
-                await ArchiveAndCleanupMissingTurumProductsAsync(shopifyHttp, turumProducts, activeSkuIndex, ct);
+                await WithBusyIndicatorAsync(
+                    "Cleaning up missing Turum products",
+                    () => ArchiveAndCleanupMissingTurumProductsAsync(shopifyHttp, turumProducts, activeSkuIndex, ct),
+                    ct);
 
             }
         }

@@ -6,6 +6,9 @@ namespace HSH.TurumShopifySync
 {
     public class TeeTextWriter : TextWriter
     {
+        private static readonly object InteractiveLock = new object();
+        private static TextWriter _interactiveConsole;
+
         private readonly TextWriter _console;
         private readonly TextWriter _file;
 
@@ -13,6 +16,7 @@ namespace HSH.TurumShopifySync
         {
             _console = console;
             _file = file;
+            _interactiveConsole = console;
         }
 
         public override Encoding Encoding => Encoding.UTF8;
@@ -55,6 +59,19 @@ namespace HSH.TurumShopifySync
         {
             _console.Write(value);
             _file.Write(value);
+        }
+
+        public static void WriteInteractive(string value)
+        {
+            lock (InteractiveLock)
+            {
+                var writer = _interactiveConsole;
+                if (writer == null)
+                    return;
+
+                writer.Write(value);
+                writer.Flush();
+            }
         }
     }
 }

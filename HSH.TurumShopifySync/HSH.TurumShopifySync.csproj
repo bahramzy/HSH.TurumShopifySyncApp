@@ -51,15 +51,16 @@
     <Compile Include="TeeTextWriter.cs" />
     <Compile Include="Models.cs" />
     <Compile Include="Program.Cleanup.cs" />
-    <Compile Include="Program.Collections.cs" />
     <Compile Include="Program.Images.cs" />
     <Compile Include="Program.Products.cs" />
     <Compile Include="Program.ShopifyApi.cs" />
     <Compile Include="Program.Turum.cs" />
     <Compile Include="Program.Variants.cs" />
     <Compile Include="TokenProviders.cs" />
+    <Compile Include="ProductSyncService.BusyIndicator.cs" />
     <Compile Include="ProductSyncService.Core.cs" />
     <Compile Include="SyncSettings.cs" />
+    <Compile Include="Program.ShopifyGraphQlOperations.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="App.config" />

@@ -3,13 +3,11 @@ using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -19,10 +17,7 @@ namespace HSH.TurumShopifySync
     {
         private static HttpClient CreateShopifyClient(string storeDomain, string adminToken, string apiVersion)
         {
-            // .NET Framework network tuning (do once)
-            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-            ServicePointManager.DefaultConnectionLimit = 50;
-            ServicePointManager.Expect100Continue = false;
+            ConfigureShopifyNetworkDefaults();
 
             var client = new HttpClient
             {
@@ -35,13 +30,9 @@ namespace HSH.TurumShopifySync
             return client;
         }
 
-        // --- Add overload for CreateShopifyClient that accepts the token provider ---
         private static HttpClient CreateShopifyClient(string storeDomain, ShopifyTokenProvider tokenProvider, string apiVersion)
         {
-            // .NET Framework network tuning (do once)
-            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-            ServicePointManager.DefaultConnectionLimit = 50;
-            ServicePointManager.Expect100Continue = false;
+            ConfigureShopifyNetworkDefaults();
 
             var handler = new TokenRefreshHandler(tokenProvider)
             {
@@ -61,368 +52,12 @@ namespace HSH.TurumShopifySync
             return client;
         }
 
-        // ==========================
-        // SHOPIFY: LOCATION
-        // ==========================
-        private static async Task<long> GetFirstShopifyLocationIdAsync(HttpClient shopify, CancellationToken ct)
+        private static void ConfigureShopifyNetworkDefaults()
         {
-            dynamic doc = await ShopifyGetAsync<dynamic>(shopify, "locations.json", ct);
-            if (doc.locations == null || doc.locations.Count == 0)
-                throw new Exception("No Shopify locations found.");
-            return (long)doc.locations[0].id;
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 50;
+            ServicePointManager.Expect100Continue = false;
         }
-
-        // ==========================
-        // SHOPIFY: BUILD SKU INDEX (sku -> productId) by paging all products
-        // ==========================
-
-        private static async Task<ShopifySkuIndexes> BuildShopifySkuIndexesAsync(HttpClient shopify, CancellationToken ct)
-        {
-            var res = new ShopifySkuIndexes();
-
-            // Pull ALL products, but only fields we need. We need status and variants.sku and id.
-            // Note: products.json supports status=active|archived|draft|any
-            // We'll fetch active+draft first, then archived.
-            await FillIndexByStatusAsync(shopify, "active", res.Active, ct);
-            //await FillIndexByStatusAsync(shopify, "draft", res.Active, ct);
-            await FillIndexByStatusAsync(shopify, "archived", res.Archived, ct);
-
-            return res;
-        }
-
-        private static async Task FillIndexByStatusAsync(
-            HttpClient shopify,
-            string status,
-            Dictionary<string, long> index,
-            CancellationToken ct)
-        {
-            string relativeUrl =
-                "products.json?limit=250"
-                + "&status=" + status
-                + "&fields=id,variants";
-
-            while (!string.IsNullOrEmpty(relativeUrl))
-            {
-                var req = new HttpRequestMessage(HttpMethod.Get, relativeUrl);
-
-                using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
-                {
-                    resp.EnsureSuccessStatusCode();
-
-                    var json = await resp.Content.ReadAsStringAsync();
-                    dynamic doc = JsonConvert.DeserializeObject(json);
-
-                    foreach (var p in doc.products)
-                    {
-                        long productId = ToLong(p.id);
-
-                        if (p.variants == null)
-                            continue;
-
-                        foreach (var v in p.variants)
-                        {
-                            var sku = ((string)v.sku ?? "").Trim();
-                            if (sku.Length == 0)
-                                continue;
-
-                            if (!index.ContainsKey(sku))
-                                index[sku] = productId;
-                        }
-                    }
-
-                    relativeUrl = TryGetNextPageRelativeUrl(resp);
-                }
-            }
-        }
-
-        private static async Task<Dictionary<string, long>> BuildShopifySkuIndexAsync(HttpClient shopify, CancellationToken ct)
-        {
-            var map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-
-            string nextUrl = "products.json?limit=250&fields=id,variants";
-            while (!string.IsNullOrWhiteSpace(nextUrl))
-            {
-                using (var resp = await ShopifySendWithRetryAsync(shopify, new HttpRequestMessage(HttpMethod.Get, nextUrl), ct))
-                {
-                    resp.EnsureSuccessStatusCode();
-
-                    var json = await resp.Content.ReadAsStringAsync();
-                    dynamic doc = JsonConvert.DeserializeObject(json);
-
-                    foreach (var p in doc.products)
-                    {
-                        long productId = (long)p.id;
-                        foreach (var v in p.variants)
-                        {
-                            string sku = (string)(v.sku ?? "");
-                            if (string.IsNullOrWhiteSpace(sku))
-                                continue;
-
-                            // Many variants share same SKU; they should point to same product id.
-                            if (!map.ContainsKey(sku))
-                                map.Add(sku, productId);
-                        }
-                    }
-
-                    nextUrl = TryGetNextPageRelativeUrl(resp);
-                }
-            }
-
-            return map;
-        }
-
-        private static string TryGetNextPageRelativeUrl(HttpResponseMessage resp)
-        {
-            IEnumerable<string> values;
-            if (!resp.Headers.TryGetValues("Link", out values))
-                return null;
-
-            var link = values.FirstOrDefault();
-            if (string.IsNullOrWhiteSpace(link))
-                return null;
-
-            foreach (var part in link.Split(','))
-            {
-                if (part.IndexOf("rel=\"next\"", StringComparison.OrdinalIgnoreCase) < 0)
-                    continue;
-
-                int start = part.IndexOf('<');
-                int end = part.IndexOf('>');
-                if (start < 0 || end <= start) continue;
-
-                var url = part.Substring(start + 1, end - start - 1);
-
-                // Convert absolute URL to relative to BaseAddress: /admin/api/{version}/...
-                var marker = "/admin/api/";
-                var idx = url.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                if (idx < 0) return url;
-
-                var after = url.Substring(idx + marker.Length); // "{version}/products.json?...”
-                var slash = after.IndexOf('/');
-                if (slash < 0) return url;
-
-                return after.Substring(slash + 1); // "products.json?...”
-            }
-
-            return null;
-        }
-
-        // ==========================
-        // SHOPIFY: GET PRODUCT (need variants + inventory_item_id)
-        // ==========================
-        private static async Task<dynamic> GetShopifyProductAsync(HttpClient shopify, long productId, CancellationToken ct)
-        {
-            var url =
-                "products/" + productId +
-                ".json?fields=id,title,vendor,product_type,tags,variants,options";
-
-            return await ShopifyGetAsync<dynamic>(shopify, url, ct);
-        }
-
-        // ==========================
-        // SHOPIFY: UPSERT VARIANTS by size (option1)
-        // ==========================
-
-        private static async Task ShopifyDeleteAsync(HttpClient shopify, string relativeUrl, CancellationToken ct)
-        {
-            var req = new HttpRequestMessage(HttpMethod.Delete, relativeUrl);
-
-            using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
-            {
-                resp.EnsureSuccessStatusCode();
-            }
-        }
-
-        // =========================
-        // Shopify: Set product category to Sneakers, using GraphQL API (becouse it is not possible vi REST API)
-        // =======================
-        private static async Task SetShopifyCategorySneakersAsync(HttpClient shopifyHttp, long productId, CancellationToken ct)
-        {
-            // Convert REST numeric ID -> GraphQL GID
-            var productGid = "gid://shopify/Product/" + productId;
-
-            var query = @"
-                        mutation($input: ProductInput!) {
-                          productUpdate(input: $input) {
-                            product { id }
-                            userErrors { field message }
-                          }
-                        }";
-
-            var payload = new
-            {
-                query = query,
-                variables = new
-                {
-                    input = new
-                    {
-                        id = productGid,
-                        category = Settings.ShopifySneakersCategoryId
-                    }
-                }
-            };
-
-            var req = new HttpRequestMessage(HttpMethod.Post, "graphql.json");
-            req.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            using (var resp = await ShopifySendWithRetryAsync(shopifyHttp, req, ct))
-            {
-                resp.EnsureSuccessStatusCode();
-
-                var json = await resp.Content.ReadAsStringAsync();
-                dynamic doc = JsonConvert.DeserializeObject(json);
-
-                // Optional: if you want to fail fast on category errors
-                if (doc.data.productUpdate.userErrors != null && doc.data.productUpdate.userErrors.Count > 0)
-                {
-                    var msg = (string)doc.data.productUpdate.userErrors[0].message;
-                    throw new Exception("Category update failed: " + msg);
-                }
-            }
-        }
-
-        //private static string DetectTurumCategory(dynamic p)
-        //{
-        //    var name = ((string)p.name ?? "").ToLowerInvariant();
-
-        //    // apparel keywords (expand over time)
-
-        //    // Bags
-        //    if (Regex.IsMatch(name, @"\b(bag|shoulder bag|crossbody|tote|duffel|backpack)\b", RegexOptions.IgnoreCase)) return "Bag";
-
-        //    // Coat before Jacket (more specific & heavier)
-        //    if (Regex.IsMatch(name, @"\b(coat|trench|overcoat|wool coat|pea coat|parka)\b", RegexOptions.IgnoreCase)) return "Coat";
-
-        //    // Jackets (outerwear) — BEFORE hoodie & sweatshirt
-        //    if (Regex.IsMatch(name, @"\b(jacket|bomber|coach|windbreaker|track jacket|varsity|denim jacket)\b", RegexOptions.IgnoreCase)) return "Jacket";
-
-        //    // Socks FIRST (so "pants + socks pack" doesn’t become Pants)
-        //    if (Regex.IsMatch(name, @"\b(sock|socks)\b", RegexOptions.IgnoreCase)) return "Socks";
-
-        //    // Pants (incl. jeans/joggers etc.)
-        //    if (Regex.IsMatch(name, @"\b(pants|trousers|jeans|chino(s)?|cargo|jogger(s)?|sweatpants|track pants)\b", RegexOptions.IgnoreCase)) return "Pants";
-
-        //    // Hoodie (more specific Sweatshirt)
-        //    if (Regex.IsMatch(name, @"\b(hoodie|hooded|zip hoodie|pullover hoodie)\b", RegexOptions.IgnoreCase)) return "Hoodie";
-
-        //    // Sweatshirt (no hood)
-        //    if (Regex.IsMatch(name, @"\b(crewneck|sweatshirt)\b", RegexOptions.IgnoreCase)) return "Sweatshirt";
-
-        //    // T-shirt
-        //    if (Regex.IsMatch(name, @"\b(t-?shirt|tshirt|tee|graphic tee|short sleeve tee|long sleeve tee)\b", RegexOptions.IgnoreCase)) return "T-shirt";
-
-
-        //    // sizes often indicate apparel (S/M/L/XL etc.)
-        //    if (p.variants != null)
-        //    {
-        //        foreach (var v in p.variants)
-        //        {
-        //            var size = ((string)v.size ?? "").Trim().ToUpperInvariant();
-        //            if (size == "XS" || size == "S" || size == "M" || size == "L" || size == "XL" || size == "XXL")
-        //                return "Apparel";
-        //        }
-        //    }
-
-        //    // default
-        //    return "Sneakers";
-        //}
-
-
-        private static async Task<T> ShopifyGetAsync<T>(HttpClient shopify, string relativeUrl, CancellationToken ct)
-        {
-            using (var resp = await ShopifySendWithRetryAsync(shopify, new HttpRequestMessage(HttpMethod.Get, relativeUrl), ct))
-            {
-                resp.EnsureSuccessStatusCode();
-                var json = await resp.Content.ReadAsStringAsync();
-                return JsonConvert.DeserializeObject<T>(json);
-            }
-        }
-
-        private static async Task ShopifyPutAsync(HttpClient shopify, string relativeUrl, object payload, CancellationToken ct)
-        {
-            var req = new HttpRequestMessage(HttpMethod.Put, relativeUrl);
-            req.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
-            {
-                if (!resp.IsSuccessStatusCode)
-                {
-                    var body = await resp.Content.ReadAsStringAsync();
-                    throw new Exception("Shopify PUT failed: " + (int)resp.StatusCode + " " + resp.ReasonPhrase + "\n" + body);
-                }
-            }
-        }
-
-        private static async Task<T> ShopifyPutAsync<T>(HttpClient shopify, string relativeUrl, object payload, Func<dynamic, T> map, CancellationToken ct)
-        {
-            var req = new HttpRequestMessage(HttpMethod.Put, relativeUrl);
-            req.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
-            {
-                if (!resp.IsSuccessStatusCode)
-                {
-                    var bodyErr = await resp.Content.ReadAsStringAsync();
-                    throw new Exception("Shopify PUT failed: " + (int)resp.StatusCode + " " + resp.ReasonPhrase + "\n" + bodyErr);
-                }
-
-                var body = await resp.Content.ReadAsStringAsync();
-                if (string.IsNullOrWhiteSpace(body))
-                    return default(T);
-
-                dynamic doc = JsonConvert.DeserializeObject(body);
-                return map(doc);
-            }
-        }
-
-        private static async Task<TOut> ShopifyPostAsync<TOut>(
-            HttpClient shopify,
-            string relativeUrl,
-            object payload,
-            Func<dynamic, TOut> selector,
-            CancellationToken ct)
-        {
-            var req = new HttpRequestMessage(HttpMethod.Post, relativeUrl);
-            req.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
-            {
-                if (!resp.IsSuccessStatusCode)
-                {
-                    var body = await resp.Content.ReadAsStringAsync();
-                    throw new Exception("Shopify POST failed: " + (int)resp.StatusCode + " " + resp.ReasonPhrase + "\n" + body);
-                }
-
-                resp.EnsureSuccessStatusCode();
-                var json = await resp.Content.ReadAsStringAsync();
-                dynamic doc = JsonConvert.DeserializeObject(json);
-                return selector(doc);
-            }
-        }
-
-        //private static async Task<HttpResponseMessage> ShopifySendWithRetryAsync(HttpClient shopify, HttpRequestMessage req, CancellationToken ct)
-        //{
-        //    // Important: HttpRequestMessage can’t be resent. We clone it each attempt.
-        //    for (int attempt = 1; attempt <= 6; attempt++)
-        //    {
-        //        var cloned = CloneRequest(req);
-
-        //        var resp = await shopify.SendAsync(cloned, ct);
-
-        //        if (resp.StatusCode == (HttpStatusCode)429 || (int)resp.StatusCode >= 500)
-        //        {
-        //            var delay = GetRetryDelay(resp, attempt);
-        //            resp.Dispose();
-        //            await Task.Delay(delay, ct);
-        //            continue;
-        //        }
-
-        //        return resp;
-        //    }
-
-        //    // Last attempt (no swallowing)
-        //    return await shopify.SendAsync(CloneRequest(req), ct);
-        //}
 
         private static async Task<HttpResponseMessage> ShopifySendWithRetryAsync(HttpClient shopify, HttpRequestMessage req, CancellationToken ct)
         {
@@ -434,19 +69,6 @@ namespace HSH.TurumShopifySync
                 {
                     resp = await shopify.SendAsync(CloneRequest(req), ct);
 
-                    // Throttle on Shopify REST call limit header
-                    var limit = TryGetCallLimit(resp);
-                    if (limit != null)
-                    {
-                        var used = limit[0];
-                        var max = limit[1];
-
-                        // If we’re close to the ceiling, wait a bit to avoid hard throttling / connection drops
-                        if (max > 0 && used >= (int)(max * 0.85))
-                            await Task.Delay(1200, ct);
-                    }
-
-                    // Retry on 429 or 5xx
                     if (resp.StatusCode == (HttpStatusCode)429 || (int)resp.StatusCode >= 500)
                     {
                         var delay = GetRetryDelay(resp, attempt);
@@ -459,7 +81,6 @@ namespace HSH.TurumShopifySync
                 }
                 catch (HttpRequestException)
                 {
-                    // Covers "underlying connection was closed" and similar transient network errors
                     var delay = TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt - 1)));
                     if (resp != null) resp.Dispose();
                     await Task.Delay(delay, ct);
@@ -474,25 +95,7 @@ namespace HSH.TurumShopifySync
                 }
             }
 
-            // final attempt, bubble errors
             return await shopify.SendAsync(CloneRequest(req), ct);
-        }
-
-        private static int[] TryGetCallLimit(HttpResponseMessage resp)
-        {
-            IEnumerable<string> values;
-            if (!resp.Headers.TryGetValues("X-Shopify-Shop-Api-Call-Limit", out values))
-                return null;
-
-            var v = values.FirstOrDefault(); // e.g. "32/40"
-            if (string.IsNullOrWhiteSpace(v)) return null;
-
-            var parts = v.Split('/');
-            int used, max;
-            if (parts.Length == 2 && int.TryParse(parts[0], out used) && int.TryParse(parts[1], out max))
-                return new[] { used, max };
-
-            return null;
         }
 
         private static TimeSpan GetRetryDelay(HttpResponseMessage resp, int attempt)
@@ -506,7 +109,6 @@ namespace HSH.TurumShopifySync
                     return TimeSpan.FromSeconds(seconds);
             }
 
-            // exponential backoff 1s,2s,4s,8s...
             var s = Math.Min(32, Math.Pow(2, attempt - 1));
             return TimeSpan.FromSeconds(s);
         }
@@ -530,7 +132,6 @@ namespace HSH.TurumShopifySync
             return clone;
         }
 
-
         private static async Task<T> ShopifyGraphQlAsync<T>(HttpClient shopify, string query, object variables, CancellationToken ct)
         {
             var payload = new
@@ -541,62 +142,157 @@ namespace HSH.TurumShopifySync
 
             var json = JsonConvert.SerializeObject(payload);
 
-            using (var req = new HttpRequestMessage(HttpMethod.Post, "graphql.json"))
+            for (int attempt = 1; attempt <= 6; attempt++)
             {
-                req.Content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
+                using (var req = new HttpRequestMessage(HttpMethod.Post, "graphql.json"))
                 {
-                    resp.EnsureSuccessStatusCode();
-                    var respJson = await resp.Content.ReadAsStringAsync();
-                    return JsonConvert.DeserializeObject<T>(respJson);
+                    req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    using (var resp = await ShopifySendWithRetryAsync(shopify, req, ct))
+                    {
+                        var respJson = await resp.Content.ReadAsStringAsync();
+                        if (!resp.IsSuccessStatusCode)
+                            throw new Exception("Shopify GraphQL HTTP failed: " + (int)resp.StatusCode + " " + resp.ReasonPhrase + "\n" + respJson);
+
+                        var doc = JsonConvert.DeserializeObject<JObject>(respJson);
+                        await DelayForGraphQlThrottleAsync(doc, ct);
+
+                        if (GraphQlResponseIsThrottled(doc) && attempt < 6)
+                        {
+                            await Task.Delay(GetGraphQlThrottleRetryDelay(doc, attempt), ct);
+                            continue;
+                        }
+
+                        return doc.ToObject<T>();
+                    }
                 }
             }
+
+            throw new Exception("Shopify GraphQL failed after throttle retries.");
         }
 
-        private static async Task<dynamic> GetShopifyProductGraphQlAsync(
-            HttpClient shopify,
-            long productId,
-            CancellationToken ct)
+        private static bool GraphQlResponseIsThrottled(JObject doc)
         {
-            var gid = $"gid://shopify/Product/{productId}";
+            var errors = doc?["errors"] as JArray;
+            if (errors == null)
+                return false;
+
+            foreach (var error in errors)
+            {
+                var code = (string)error["extensions"]?["code"];
+                var message = (string)error["message"];
+
+                if (string.Equals(code, "THROTTLED", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrWhiteSpace(message) && message.IndexOf("throttled", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static TimeSpan GetGraphQlThrottleRetryDelay(JObject doc, int attempt)
+        {
+            var restoreRate = ReadGraphQlCostDecimal(doc, "restoreRate");
+            if (restoreRate > 0)
+            {
+                var requested = ReadGraphQlCostDecimal(doc, "requestedQueryCost");
+                var available = ReadGraphQlCostDecimal(doc, "currentlyAvailable");
+                var missing = Math.Max(10m, requested - available);
+                var seconds = Math.Min(10m, missing / restoreRate);
+                return TimeSpan.FromMilliseconds((double)(seconds * 1000m) + 250);
+            }
+
+            return TimeSpan.FromSeconds(Math.Min(10, Math.Pow(2, attempt - 1)));
+        }
+
+        private static async Task DelayForGraphQlThrottleAsync(JObject doc, CancellationToken ct)
+        {
+            var restoreRate = ReadGraphQlCostDecimal(doc, "restoreRate");
+            if (restoreRate <= 0)
+                return;
+
+            var available = ReadGraphQlCostDecimal(doc, "currentlyAvailable");
+            var threshold = 10m;
+
+            if (available >= threshold)
+                return;
+
+            var seconds = Math.Min(2m, (threshold - available) / restoreRate);
+            if (seconds <= 0)
+                return;
+
+            await Task.Delay(TimeSpan.FromMilliseconds((double)(seconds * 1000m) + 100), ct);
+        }
+
+        private static decimal ReadGraphQlCostDecimal(JObject doc, string name)
+        {
+            var cost = doc?["extensions"]?["cost"];
+            if (cost == null)
+                return 0m;
+
+            JToken token;
+            if (name == "currentlyAvailable" || name == "restoreRate")
+                token = cost["throttleStatus"]?[name];
+            else
+                token = cost[name];
+
+            if (token == null)
+                return 0m;
+
+            decimal value;
+            return decimal.TryParse(token.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out value)
+                ? value
+                : 0m;
+        }
+        private static async Task<dynamic> GetShopifyProductGraphQlAsync(HttpClient shopify, long productId, CancellationToken ct)
+        {
+            var gid = "gid://shopify/Product/" + productId;
 
             const string query = @"
-                    query ($id: ID!) {
-                      product(id: $id) {
-                        id
-                        title
-                        vendor
-                        productType
-                        tags
-                        options {
-                          name
-                          values
-                        }
-                        variants(first: 250) {
-                          edges {
-                            node {
-                              id
-                              title
-                              price
-                              position
-                              barcode
-                              selectedOptions { name value }
-                              inventoryQuantity
-                              inventoryItem { legacyResourceId }
-                              metafield(namespace: ""custom"", key: ""hsh_antal"") { value }
-                            }
-                          }
+                query ($id: ID!) {
+                  product(id: $id) {
+                    id
+                    title
+                    vendor
+                    productType
+                    tags
+                    status
+                    media(first: 1) {
+                      nodes {
+                        ... on MediaImage { image { url } }
+                      }
+                    }
+                    options { name values }
+                    variants(first: 250) {
+                      edges {
+                        node {
+                          id
+                          title
+                          price
+                          position
+                          barcode
+                          selectedOptions { name value }
+                          inventoryQuantity
+                          inventoryItem { legacyResourceId }
+                          metafield(namespace: ""custom"", key: ""hsh_antal"") { value }
                         }
                       }
-                    }";
+                    }
+                  }
+                }";
 
-            dynamic gql = await ShopifyGraphQlAsync<dynamic>(shopify, query, new { id = gid }, ct);
+            dynamic gql = await ShopifyGraphQlDocumentAsync(shopify, query, new { id = gid }, ct);
             var p = gql?.data?.product;
             if (p == null)
                 return new { product = (object)null };
 
-            // Convert tags list -> CSV string (REST-style)
+            return NormalizeShopifyProductGraphQlNode(p);
+        }
+
+        private static dynamic NormalizeShopifyProductGraphQlNode(dynamic p)
+        {
             string tagsCsv = "";
             try
             {
@@ -604,26 +300,34 @@ namespace HSH.TurumShopifySync
                 foreach (var t in p.tags)
                     tagsList.Add((string)t);
 
-                tagsCsv = string.Join(", ", tagsList); // REST usually comes back comma+space
+                tagsCsv = string.Join(", ", tagsList);
             }
             catch { tagsCsv = ""; }
 
-            // Flatten variants to REST-style array
             var flatVariants = new List<object>();
+            string firstImageSrc = "";
+
+            try
+            {
+                if (p.media != null && p.media.nodes != null && p.media.nodes.Count > 0)
+                    firstImageSrc = (string)(p.media.nodes[0].image?.url ?? "");
+            }
+            catch { firstImageSrc = ""; }
 
             try
             {
                 foreach (var edge in p.variants.edges)
                 {
                     var n = edge.node;
-
-                    // option1 (Size) from selectedOptions; fallback to title
                     string option1 = null;
+
                     try
                     {
                         foreach (var opt in n.selectedOptions)
                         {
-                            if (((string)opt.name).Equals("Size", StringComparison.OrdinalIgnoreCase))
+                            var optName = (string)opt.name;
+                            if (optName.Equals("Size", StringComparison.OrdinalIgnoreCase) ||
+                                optName.Equals("Vælg størrelse", StringComparison.OrdinalIgnoreCase))
                             {
                                 option1 = (string)opt.value;
                                 break;
@@ -633,12 +337,11 @@ namespace HSH.TurumShopifySync
                         if (string.IsNullOrWhiteSpace(option1) && n.selectedOptions != null)
                             option1 = (string)n.selectedOptions[0].value;
                     }
-                    catch { /* ignore */ }
+                    catch { }
 
                     if (string.IsNullOrWhiteSpace(option1))
                         option1 = (string)(n.title ?? "");
 
-                    // Build REST-like variant object
                     var metafields = new List<object>();
                     try
                     {
@@ -653,11 +356,11 @@ namespace HSH.TurumShopifySync
                             });
                         }
                     }
-                    catch { /* ignore */ }
+                    catch { }
 
                     flatVariants.Add(new
                     {
-                        id = ExtractLegacyIdFromGid((string)n.id), // numeric variant id (optional, but nice)
+                        id = ExtractLegacyIdFromGid((string)n.id),
                         title = (string)n.title,
                         price = n.price,
                         position = n.position,
@@ -669,12 +372,8 @@ namespace HSH.TurumShopifySync
                     });
                 }
             }
-            catch
-            {
-                // if variants missing, keep empty list
-            }
+            catch { }
 
-            // Return object shaped like REST: { product: { ... } }
             return new
             {
                 product = new
@@ -683,14 +382,14 @@ namespace HSH.TurumShopifySync
                     title = (string)p.title,
                     vendor = (string)p.vendor,
                     product_type = (string)p.productType,
-                    tags = tagsCsv, // CSV string
+                    tags = tagsCsv,
+                    image_src = firstImageSrc,
                     options = NormalizeOptions(p.options),
                     variants = flatVariants
                 }
             };
         }
 
-        // Shopify GraphQL IDs are like: gid://shopify/ProductVariant/1234567890
         private static long ExtractLegacyIdFromGid(string gid)
         {
             if (string.IsNullOrWhiteSpace(gid)) return 0;
@@ -722,8 +421,5 @@ namespace HSH.TurumShopifySync
 
             return list;
         }
-
-
-
     }
 }

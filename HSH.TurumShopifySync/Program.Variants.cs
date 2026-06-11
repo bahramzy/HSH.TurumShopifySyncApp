@@ -18,671 +18,216 @@ namespace HSH.TurumShopifySync
     internal static partial class ProductSyncService
     {
         private static async Task<bool> UpsertVariantsBySizeAsync(HttpClient shopify, long productId, dynamic shopifyProductDoc, TurumProduct turum, CancellationToken ct)
-
         {
-
             bool createdAny = false;
-
             bool deletedAny = false;
 
-
-
-            // existingBySize: option1 -> variant object
-
             var existingBySize = new Dictionary<string, dynamic>(StringComparer.OrdinalIgnoreCase);
-
             var existingSizes = new List<string>();
-
+            var seenSizes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             bool blockNewVariantCreation = false;
 
-
-
-            var seenSizes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-
-
-            // Collect existing variants and sizes
-
-            // Shopify product variants - size -> variant object dictionary
-
             try
-
             {
-
                 foreach (var sv in shopifyProductDoc.product.variants)
-
                 {
-
                     string size = (string)(sv.option1 ?? sv.title ?? "");
-
                     if (string.IsNullOrWhiteSpace(size)) continue;
-
                     size = size.Trim();
 
-
-
                     if (!existingBySize.ContainsKey(size))
-
                     {
-
                         existingBySize[size] = sv;
-
                         existingSizes.Add(size);
-
                     }
-
                 }
-
             }
-
             catch
-
             {
-
-                // If shopifyProductDoc shape is unexpected, fall back to empty existing set
-
+                // If shopifyProductDoc shape is unexpected, fall back to empty existing set.
             }
-
-
-
-            // Collect Turum sizes (deduped and in source order)
 
             var turumSizes = new List<string>();
-
             foreach (var tv in turum.variants)
-
             {
-
-                var size = (tv.eu_size ?? tv.size);
-
+                var size = tv.eu_size ?? tv.size;
                 if (string.IsNullOrWhiteSpace(size)) continue;
-
                 size = size.Trim();
 
                 if (!turumSizes.Contains(size, StringComparer.OrdinalIgnoreCase))
-
                     turumSizes.Add(size);
-
             }
-
-
-
-            // Desired sizes = union(existingSizes, turumSizes) then sorted by CompareSizes
 
             var desiredSizes = new List<string>(existingSizes);
-
             foreach (var s in turumSizes)
-
             {
-
                 if (!desiredSizes.Contains(s, StringComparer.OrdinalIgnoreCase))
-
                     desiredSizes.Add(s);
-
             }
-
-
 
             desiredSizes.Sort(Comparer<string>.Create((a, b) => CompareSizes(a, b)));
 
-
-
-            // Helper: desired position (1-based) for a size
-
-            Func<string, int> getDesiredPosition = size =>
-
-            {
-
-                for (int i = 0; i < desiredSizes.Count; i++)
-
-                {
-
-                    if (string.Equals(desiredSizes[i], size, StringComparison.OrdinalIgnoreCase))
-
-                        return i + 1;
-
-                }
-
-                return desiredSizes.Count + 1;
-
-            };
-
-
-
-            // Keep created variants to position them after creation
-
             var createdVariants = new List<(string size, long variantId)>();
-
-
-
-            // First pass: update existing variants' price/sku and create missing variants
+            var variantUpdates = new List<VariantUpdateInput>();
 
             foreach (var tv in turum.variants)
-
             {
-
-                var size = (tv.eu_size ?? tv.size);
-
+                var size = tv.eu_size ?? tv.size;
                 if (string.IsNullOrWhiteSpace(size)) continue;
-
                 size = size.Trim();
 
-
-
-                if (!seenSizes.Add(size)) continue; // skip duplicates from TURUM
-
-
+                if (!seenSizes.Add(size)) continue;
 
                 var raw = ConvertToDkk(tv.price) * Settings.MomsRate + Settings.Profit;
-
                 var dkk = RoundRetailPrice(raw);
 
-
-
                 dynamic existing;
-
                 if (existingBySize.TryGetValue(size, out existing))
-
                 {
-
                     var oldPrice = ParseShopifyMoney(existing.price);
-
-                    var newPrice = dkk;
-
-
-
-                    if (oldPrice == newPrice)
-
+                    if (oldPrice == dkk)
                         continue;
-
-
 
                     long variantId = ToLong(existing.id);
-
-
-
-                    var payload = new
-
-                    {
-
-                        variant = new
-
-                        {
-
-                            id = variantId,
-
-                            price = dkk.ToString("0", CultureInfo.InvariantCulture),
-
-                            sku = turum.sku
-
-                        }
-
-                    };
-
-
-
-                    await ShopifyPutAsync(shopify, "variants/" + variantId + ".json", payload, ct);
-
+                    variantUpdates.Add(new VariantUpdateInput { VariantId = variantId, Price = dkk, Sku = turum.sku });
+                    continue;
                 }
 
-                else
+                if (blockNewVariantCreation)
+                    continue;
 
+                try
                 {
-
-                    if (blockNewVariantCreation) continue;
-
-
-
-                    var payload = new
-
-                    {
-
-                        variant = new
-
-                        {
-
-                            option1 = size,
-
-                            price = dkk.ToString("0", CultureInfo.InvariantCulture),
-
-                            sku = turum.sku,
-
-                            inventory_management = "shopify",
-
-                            inventory_policy = "deny",
-
-                            taxable = false,
-
-                            requires_shipping = true,
-
-                            barcode = tv.ean
-
-                        }
-
-                    };
-
-
-
-                    try
-
-                    {
-
-                        // Create and capture response to obtain created variant id
-
-                        var resp = await ShopifyPostAsync<dynamic>(shopify, "products/" + productId + "/variants.json", payload, doc => doc, ct);
-
-
-
-                        // Log full create response for debugging
-
-                        //try
-
-                        //{
-
-                        //    Console.WriteLine("[DEBUG] Variant create response: " + JsonConvert.SerializeObject(resp));
-
-                        //}
-
-                        //catch { /* ignore logging errors */ }
-
-
-
-                        long createdVariantId = 0;
-
-                        try { createdVariantId = ToLong(resp.variant.id); } catch { createdVariantId = 0; }
-
-
-
-                        createdAny = true;
-
-
-
-                        if (createdVariantId > 0)
-
-                        {
-
-                            createdVariants.Add((size, createdVariantId));
-
-                            Console.WriteLine("CREATED variant SKU " + turum.sku + " size " + size + " productId " + productId + " variantId " + createdVariantId);
-
-
-
-                            // Verify variant exists server-side (same store/token)
-
-                            //try
-
-                            //{
-
-                            //    dynamic vdoc = await ShopifyGetAsync<dynamic>(shopify, "variants/" + createdVariantId + ".json", ct);
-
-                            //    Console.WriteLine("[DEBUG] Fetched created variant " + createdVariantId + ": " + JsonConvert.SerializeObject(vdoc));
-
-                            //}
-
-                            //catch (Exception ex)
-
-                            //{
-
-                            //    // 404 or other errors — surface for debugging
-
-                            //    Console.WriteLine("[WARN] Fetching created variant " + createdVariantId + " failed: " + ex.Message);
-
-                            //    Console.WriteLine("[WARN] You should inspect the POST response above and ensure Postman uses the same store/token and API version.");
-
-                            //}
-
-
-
-                            // Fetch product to inspect options & variant list
-
-                            //try
-
-                            //{
-
-                            //    dynamic pdoc = await ShopifyGetAsync<dynamic>(shopify, "products/" + productId + ".json?fields=variants,options", ct);
-
-                            //    Console.WriteLine("[DEBUG] Product variants after create: " + JsonConvert.SerializeObject(pdoc.product.variants));
-
-                            //    Console.WriteLine("[DEBUG] Product options after create: " + JsonConvert.SerializeObject(pdoc.product.options));
-
-                            //}
-
-                            //catch (Exception ex)
-
-                            //{
-
-                            //    Console.WriteLine("[WARN] Failed to fetch product after variant create: " + ex.Message);
-
-                            //}
-
-                        }
-
-                        else
-
-                        {
-
-                            // No numeric id in response — log and throw to make failure visible
-
-                            Console.WriteLine("[ERROR] Variant create response did not include numeric id: " + JsonConvert.SerializeObject(resp));
-
-                            throw new Exception("Variant create returned no id for product " + productId + " size " + size);
-
-                        }
-
-                    }
-
-                    catch (Exception ex)
-
-                    {
-
-                        if (ex.Message.IndexOf("option value linked to a metafield", StringComparison.OrdinalIgnoreCase) >= 0)
-
-                        {
-
-                            blockNewVariantCreation = true;
-
-                            Console.WriteLine("SKIP creating new variant (connected options): SKU " + turum.sku + " size " + size + " productId " + productId);
-
-                            continue;
-
-                        }
-
-
-
-                        throw;
-
-                    }
-
+                    var createdVariantId = await CreateVariantGraphQlAsync(shopify, productId, size, dkk, turum.sku, tv.ean, ct);
+                    createdAny = true;
+                    createdVariants.Add((size, createdVariantId));
+                    Console.WriteLine("CREATED variant SKU " + turum.sku + " size " + size + " productId " + productId + " variantId " + createdVariantId);
                 }
+                catch (Exception ex)
+                {
+                    if (ex.Message.IndexOf("option value linked to a metafield", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        blockNewVariantCreation = true;
+                        Console.WriteLine("SKIP creating new variant (connected options): SKU " + turum.sku + " size " + size + " productId " + productId);
+                        continue;
+                    }
 
+                    throw;
+                }
             }
 
-
-
-            // Second pass: set positions for created variants (do this in desired order)
+            if (variantUpdates.Count > 0)
+                await UpdateVariantsGraphQlAsync(shopify, productId, variantUpdates, ct);
 
             if (createdVariants.Count > 0)
-
             {
-
                 Console.WriteLine("[INFO] Created " + createdVariants.Count + " variants. Starting position updates. SKU " + turum.sku + " productId " + productId);
 
-
-
-                // Map created size -> id for quick lookup
-
                 var createdMap = createdVariants.ToDictionary(x => x.size, x => x.variantId, StringComparer.OrdinalIgnoreCase);
-
-
+                var positions = new List<(long id, int position)>();
 
                 int desiredPos = 1;
-
                 foreach (var s in desiredSizes)
-
                 {
-
-                    if (createdMap.TryGetValue(s, out var vid))
-
+                    long vid;
+                    if (createdMap.TryGetValue(s, out vid))
                     {
-
                         Console.WriteLine("Setting position for created variant SKU " + turum.sku + " size " + s + " to " + desiredPos);
-
-                        try
-
-                        {
-
-                            var posPayload = new
-
-                            {
-
-                                variant = new
-
-                                {
-
-                                    id = vid,
-
-                                    position = desiredPos
-
-                                }
-
-                            };
-
-
-
-                            await ShopifyPutAsync<dynamic>(shopify, "variants/" + vid + ".json", posPayload, d => d, ct);
-
-                        }
-
-                        catch (Exception ex)
-
-                        {
-
-                            // Non-fatal: log and continue. Caller still has a fallback reorder step.
-
-                            Console.WriteLine("[WARN] Failed to set variant position for created variant " + vid + " product " + productId + " size " + s + " : " + ex.Message);
-
-                        }
-
+                        positions.Add((vid, desiredPos));
                     }
-
-
 
                     desiredPos++;
-
                 }
 
+                if (positions.Count > 0)
+                {
+                    try
+                    {
+                        await ReorderVariantsGraphQlAsync(shopify, productId, positions, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("[WARN] Failed to set created variant positions for product " + productId + ": " + ex.Message);
+                    }
+                }
             }
-
-
-
-            // Remove Shopify variants that are not present in Turum anymore.
-
-            // Keep variants that have special barcodes (e.g. "HSH") as a safety.
 
             try
-
             {
-
                 var turumSet = new HashSet<string>(turumSizes, StringComparer.OrdinalIgnoreCase);
 
-
-
                 foreach (var kv in existingBySize)
-
                 {
-
                     var size = kv.Key;
-
-                    // If Turum still has this size, keep it
-
                     if (turumSet.Contains(size))
-
                         continue;
-
-
 
                     dynamic sv = kv.Value;
-
                     var barcode = ((string)sv.barcode ?? "").Trim();
 
-
-
-                    // Preserve HSH-marked variants (or any other special barcode)
-
                     if (string.Equals(barcode, "HSH", StringComparison.OrdinalIgnoreCase))
-
                         continue;
 
-
-
                     long variantId = ToLong(sv.id);
-
                     if (variantId <= 0) continue;
 
-
-
                     try
-
                     {
-
-                        await ShopifyDeleteAsync(shopify, "variants/" + variantId + ".json", ct);
-
+                        await DeleteVariantGraphQlAsync(shopify, productId, variantId, ct);
                         deletedAny = true;
-
                         Console.WriteLine("[INFO] Deleted Shopify-only variant size " + size + " variantId " + variantId + " for product " + productId);
-
                     }
-
                     catch (Exception ex)
-
                     {
-
                         Console.WriteLine("[WARN] Failed to delete variant " + variantId + ": " + ex.Message);
-
-                        // non-fatal — continue
-
                     }
-
                 }
-
             }
-
             catch (Exception ex)
-
             {
-
                 Console.WriteLine("[WARN] Cleanup extra variants failed: " + ex.Message);
-
             }
-
-
 
             return createdAny || deletedAny;
-
         }
-
-
-
         private static async Task EnsureVariantPositionsBySizeAsync(HttpClient shopify, long productId, dynamic shopifyProductDoc, CancellationToken ct)
-
         {
-
             if (shopifyProductDoc == null || shopifyProductDoc.product == null || shopifyProductDoc.product.variants == null)
-
                 return;
-
-
-
-            // Build list: (id, size, currentPosition)
 
             var list = new List<(long id, string size, int pos)>();
 
-
-
             foreach (var v in shopifyProductDoc.product.variants)
-
             {
-
                 var id = ToLong(v.id);
-
-
-
-                // Size is usually option1 (your "Vælg størrelse")
-
                 var size = (string)(v.option1 ?? v.title ?? "");
-
                 size = (size ?? "").Trim();
-
-                if (size.Length == 0) continue;
-
-
+                if (size.Length == 0 || id <= 0) continue;
 
                 int pos = 0;
-
-                try { pos = (int)v.position; } catch { /* ignore */ }
-
-
+                try { pos = (int)v.position; } catch { }
 
                 list.Add((id, size, pos));
-
             }
-
-
-
-            // Sort by size
 
             list.Sort((a, b) => CompareSizes(a.size, b.size));
 
-
-
-            // Update only if position differs
-
-            int desired = 1;
-
-            foreach (var item in list)
-
+            var positions = new List<(long id, int position)>();
+            for (int i = 0; i < list.Count; i++)
             {
-
-                if (item.pos == desired)
-
+                var desired = i + 1;
+                if (list[i].pos != desired)
                 {
-
-                    desired++;
-
-                    continue;
-
+                    Console.WriteLine("Reorder variant position SKU? productId " + productId +
+                                      " size " + list[i].size + " " + list[i].pos + " -> " + desired);
                 }
 
-
-
-                Console.WriteLine("Reorder variant position SKU? productId " + productId +
-
-                                  " size " + item.size + " " + item.pos + " -> " + desired);
-
-
-
-                var payload = new
-
-                {
-
-                    variant = new
-
-                    {
-
-                        id = item.id,
-
-                        position = desired
-
-                    }
-
-                };
-
-
-
-                // Use your generic PUT helper if you have it:
-
-                await ShopifyPutAsync<dynamic>(
-
-                    shopify,
-
-                    "variants/" + item.id + ".json",
-
-                    payload,
-
-                    d => d,
-
-                    ct);
-
-
-
-                desired++;
-
+                positions.Add((list[i].id, desired));
             }
 
+            if (positions.Count > 0)
+                await ReorderVariantsGraphQlAsync(shopify, productId, positions, ct);
         }
-
-
-
         private static int CompareSizes(string a, string b)
 
         {
@@ -872,143 +417,8 @@ namespace HSH.TurumShopifySync
 
 
         // ==========================
-
-        // SHOPIFY: INVENTORY (set to Turum stock; missing sizes -> 0)
-
+        // SHOPIFY: INVENTORY
         // ==========================
-
-
-
-        //private static async Task SetInventoryFromTurumAsync(HttpClient shopify, long locationId, dynamic shopifyProductDoc, TurumProduct turum, CancellationToken ct)
-
-        //{
-
-        //    var stockBySize = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-
-
-        //    foreach (var v in turum.variants)
-
-        //    {
-
-        //        var size = (v.eu_size ?? v.size);
-
-        //        if (string.IsNullOrWhiteSpace(size))
-
-        //            continue;
-
-
-
-        //        stockBySize[size.Trim()] = v.stock;
-
-        //    }
-
-
-
-        //    foreach (var sv in shopifyProductDoc.product.variants)
-
-        //    {
-
-        //        string size = (string)(sv.option1 ?? sv.title ?? "");
-
-        //        if (string.IsNullOrWhiteSpace(size))
-
-        //            continue;
-
-
-
-        //        size = size.Trim();
-
-
-
-        //        int available;
-
-        //        if (!stockBySize.TryGetValue(size, out available))
-
-        //        {
-
-        //            //available = 0;
-
-        //            // If size not in TURUM, do NOT touch Shopify inventory
-
-        //            continue;
-
-        //        }
-
-
-
-        //        long inventoryItemId = (long)sv.inventory_item_id;
-
-
-
-        //        int currentQty = 0;
-
-        //        try
-
-        //        {
-
-        //            // Shopify returns inventory_quantity on variant in many product responses
-
-        //            currentQty = (int)sv.inventory_quantity;
-
-        //        }
-
-        //        catch
-
-        //        {
-
-        //            // if missing, keep 0 and proceed with update
-
-        //        }
-
-
-
-        //        //Console.WriteLine($"[INV-CHECK] SKU {turum.sku} size {size} | Shopify={currentQty} Turum={available}");
-
-
-
-
-
-        //        if (currentQty == available)
-
-        //        {
-
-        //            //Console.WriteLine($"[INV-SKIP] SKU {turum.sku} size {size} (no change)");
-
-
-
-        //            // skip inventory update
-
-        //            //Console.WriteLine("SKIP inventory update...");
-
-        //            continue;
-
-        //        }
-
-
-
-        //        var payload = new
-
-        //        {
-
-        //            location_id = locationId,
-
-        //            inventory_item_id = inventoryItemId,
-
-        //            available = available
-
-        //        };
-
-
-
-        //        await ShopifyPostAsync<dynamic>(shopify, "inventory_levels/set.json", payload, doc => doc, ct);
-
-        //    }
-
-        //}
-
-
-
         private static async Task SetInventoryFromTurumAsync(
 
             HttpClient shopify,
@@ -1024,6 +434,7 @@ namespace HSH.TurumShopifySync
         {
 
             var stockBySize = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var inventoryUpdates = new List<InventoryQuantityInput>();
 
 
 
@@ -1049,7 +460,7 @@ namespace HSH.TurumShopifySync
 
             {
 
-                // REST-style: option1 is typically the Size
+                // Normalized shape: option1 is typically the Size
 
                 string size = (string)(sv.option1 ?? sv.title ?? "");
 
@@ -1147,7 +558,7 @@ namespace HSH.TurumShopifySync
 
                 {
 
-                    // normalized uses REST-style name
+                    // normalized product document uses this field name
 
                     currentQty = (int)sv.inventory_quantity;
 
@@ -1169,23 +580,12 @@ namespace HSH.TurumShopifySync
 
 
 
-                var payload = new
-
-                {
-
-                    location_id = locationId,
-
-                    inventory_item_id = inventoryItemId,
-
-                    available = available
-
-                };
-
-
-
-                await ShopifyPostAsync<dynamic>(shopify, "inventory_levels/set.json", payload, doc => doc, ct);
+                inventoryUpdates.Add(new InventoryQuantityInput { InventoryItemId = inventoryItemId, Quantity = available });
 
             }
+
+            if (inventoryUpdates.Count > 0)
+                await SetInventoryQuantitiesGraphQlAsync(shopify, locationId, inventoryUpdates, ct);
 
         }
 

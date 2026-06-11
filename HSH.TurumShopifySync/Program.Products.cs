@@ -17,84 +17,6 @@ namespace HSH.TurumShopifySync
 {
     internal static partial class ProductSyncService
     {
-        private static object BuildShopifyCreateProductPayload(TurumProduct p, bool includeImage, string category)
-        {
-            var optionValues = p.variants
-                .Select(v => (v.eu_size ?? v.size))
-                .Where(s => !string.IsNullOrWhiteSpace(s))
-                .Select(s => s.Trim())
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            var variants = p.variants
-                .Where(v => !string.IsNullOrWhiteSpace(v.eu_size ?? v.size))
-                .Select(v =>
-                {
-                    var size = (v.eu_size ?? v.size).Trim();
-
-                    var raw = ConvertToDkk(v.price) * Settings.MomsRate + Settings.Profit;
-                    var dkk = RoundRetailPrice(raw);
-
-                    return new
-                    {
-                        option1 = size,
-                        price = dkk.ToString("0", CultureInfo.InvariantCulture),
-                        sku = p.sku, // SAME SKU for all variants
-                        inventory_management = "shopify",
-                        inventory_policy = "deny",
-                        taxable = true,
-                        requires_shipping = true,
-                        barcode = v.ean
-                    };
-                })
-                .ToList();
-
-            if (!includeImage)
-                Console.WriteLine("SKIP invalid image url for SKU " + p.sku + ": " + p.image);
-
-            // Tags and category
-            var productType = category == "Sneakers" ? "Sneakers" : category;
-
-            // Use the helper to build tags
-            string tags = TagsMergeAndCleanUp(null, p, category);
-
-            // Shopify product payload
-            return new
-            {
-                product = new
-                {
-                    title = p.name,
-                    vendor = p.brand,
-                    product_type = productType,
-                    status = "active",
-                    tags = string.Join(", ", tags),
-                    options = new[]
-                    {
-                        new { name = "Vælg størrelse", position = 1, values = optionValues }
-                    },
-                    variants = variants,
-                    images = includeImage
-                        ? new[] { new { src = p.image, alt = p.name } }
-                        : new object[0],
-                }
-            };
-        }
-
-        private static object BuildShopifyUpdateProductPayload(long productId, TurumProduct p, string mergedTags, string category)
-        {
-            return new
-            {
-                product = new
-                {
-                    id = productId,
-                    title = p.name,
-                    vendor = p.brand,
-                    product_type = category,
-                    tags = mergedTags
-                }
-            };
-        }
-
         //private static string ToTitleCase(string value)
         //{
         //    if (string.IsNullOrWhiteSpace(value))
@@ -186,7 +108,7 @@ namespace HSH.TurumShopifySync
             if (shopifyProductDoc == null || shopifyProductDoc.product == null)
                 return false;
 
-            // Shopify REST returns tags as comma-separated string
+            // Normalized product documents keep tags as a comma-separated string
             string tags = (string)(shopifyProductDoc.product.tags ?? "");
             if (string.IsNullOrWhiteSpace(tags)) return false;
 
