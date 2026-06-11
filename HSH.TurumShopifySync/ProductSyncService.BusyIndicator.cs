@@ -15,8 +15,12 @@ namespace HSH.TurumShopifySync
             var operationTask = operation();
             var dots = 0;
             var lastTextLength = 0;
+            var useInteractiveSpinner = ShouldUseInteractiveSpinner();
 
-            WriteBusyLine(message, ref lastTextLength);
+            if (useInteractiveSpinner)
+                WriteBusyLine(message, ref lastTextLength);
+            else
+                Console.WriteLine(message + "...");
 
             while (!operationTask.IsCompleted)
             {
@@ -26,19 +30,25 @@ namespace HSH.TurumShopifySync
                     break;
 
                 dots = dots == 3 ? 1 : dots + 1;
-                WriteBusyLine(message + new string('.', dots), ref lastTextLength);
+
+                if (useInteractiveSpinner)
+                    WriteBusyLine(message + new string('.', dots), ref lastTextLength);
             }
 
             try
             {
                 var result = await operationTask;
-                ClearBusyLine(lastTextLength);
+                if (useInteractiveSpinner)
+                    ClearBusyLine(lastTextLength);
+
                 Console.WriteLine(message + " done in " + (DateTime.UtcNow - started).ToString(@"hh\:mm\:ss\.fff"));
                 return result;
             }
             catch
             {
-                ClearBusyLine(lastTextLength);
+                if (useInteractiveSpinner)
+                    ClearBusyLine(lastTextLength);
+
                 Console.WriteLine(message + " failed after " + (DateTime.UtcNow - started).ToString(@"hh\:mm\:ss\.fff"));
                 throw;
             }
@@ -54,6 +64,26 @@ namespace HSH.TurumShopifySync
                     return null;
                 },
                 ct);
+        }
+
+        private static bool ShouldUseInteractiveSpinner()
+        {
+            if (IsTruthyEnvironmentVariable("GITHUB_ACTIONS") ||
+                IsTruthyEnvironmentVariable("CI") ||
+                Console.IsOutputRedirected)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsTruthyEnvironmentVariable(string name)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
         }
 
         private static void WriteBusyLine(string text, ref int lastTextLength)
