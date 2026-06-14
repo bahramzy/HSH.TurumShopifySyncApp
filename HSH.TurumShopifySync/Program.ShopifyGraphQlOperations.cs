@@ -312,7 +312,7 @@ namespace HSH.TurumShopifySync
             };
 
             dynamic doc = await ShopifyGraphQlDocumentAsync(shopify, query, variables, ct);
-            if (ProductVariantUpdateErrorsAreOnlyMissing(doc.data.productVariantsBulkUpdate.userErrors))
+            if (ProductVariantErrorsAreOnlyMissing(doc.data.productVariantsBulkUpdate.userErrors))
             {
                 Console.WriteLine("[WARN] SKIP variant update for missing/deleted Shopify variant. productId " + productId);
                 return;
@@ -321,7 +321,7 @@ namespace HSH.TurumShopifySync
             ThrowIfUserErrors(doc.data.productVariantsBulkUpdate.userErrors, "productVariantsBulkUpdate " + productId);
         }
 
-        private static bool ProductVariantUpdateErrorsAreOnlyMissing(dynamic userErrors)
+        private static bool ProductVariantErrorsAreOnlyMissing(dynamic userErrors)
         {
             try
             {
@@ -428,6 +428,12 @@ namespace HSH.TurumShopifySync
             };
 
             dynamic doc = await ShopifyGraphQlDocumentAsync(shopify, query, variables, ct);
+            if (ProductVariantErrorsAreOnlyMissing(doc.data.productVariantsBulkReorder.userErrors))
+            {
+                Console.WriteLine("[WARN] SKIP variant reorder for missing/deleted Shopify variant. productId " + productId);
+                return;
+            }
+
             ThrowIfUserErrors(doc.data.productVariantsBulkReorder.userErrors, "productVariantsBulkReorder " + productId);
         }
 
