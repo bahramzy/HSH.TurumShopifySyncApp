@@ -488,7 +488,11 @@ namespace HSH.TurumShopifySync
                 query($cursor: String) {
                   collections(first: 250, after: $cursor) {
                     pageInfo { hasNextPage endCursor }
-                    nodes { id title }
+                    nodes {
+                      id
+                      title
+                      ruleSet { appliedDisjunctively }
+                    }
                   }
                 }";
 
@@ -502,6 +506,9 @@ namespace HSH.TurumShopifySync
                     if (title.Length == 0)
                         continue;
 
+                    if (CollectionHasRules(c))
+                        continue;
+
                     if (!_collectionIdCache.ContainsKey(title))
                         _collectionIdCache[title] = ExtractLegacyIdFromGid((string)c.id);
                 }
@@ -510,6 +517,18 @@ namespace HSH.TurumShopifySync
                     return;
 
                 cursor = (string)doc.data.collections.pageInfo.endCursor;
+            }
+        }
+
+        private static bool CollectionHasRules(dynamic collection)
+        {
+            try
+            {
+                return collection.ruleSet != null;
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -536,6 +555,12 @@ namespace HSH.TurumShopifySync
                     var message = (string)doc.data.collectionAddProducts.userErrors[0].message;
                     if (!string.IsNullOrWhiteSpace(message) && message.IndexOf("already", StringComparison.OrdinalIgnoreCase) >= 0)
                         return;
+
+                    if (!string.IsNullOrWhiteSpace(message) && message.IndexOf("smart collection", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        Console.WriteLine("[WARN] SKIP collection add (smart collection) productId " + productId + " collectionId " + collectionId);
+                        return;
+                    }
                 }
             }
             catch { }
