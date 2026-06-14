@@ -312,7 +312,38 @@ namespace HSH.TurumShopifySync
             };
 
             dynamic doc = await ShopifyGraphQlDocumentAsync(shopify, query, variables, ct);
+            if (ProductVariantUpdateErrorsAreOnlyMissing(doc.data.productVariantsBulkUpdate.userErrors))
+            {
+                Console.WriteLine("[WARN] SKIP variant update for missing/deleted Shopify variant. productId " + productId);
+                return;
+            }
+
             ThrowIfUserErrors(doc.data.productVariantsBulkUpdate.userErrors, "productVariantsBulkUpdate " + productId);
+        }
+
+        private static bool ProductVariantUpdateErrorsAreOnlyMissing(dynamic userErrors)
+        {
+            try
+            {
+                if (userErrors == null || userErrors.Count == 0)
+                    return false;
+
+                foreach (var error in userErrors)
+                {
+                    var message = (string)error.message;
+                    if (string.IsNullOrWhiteSpace(message) ||
+                        message.IndexOf("variant does not exist", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+            catch (Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
+            {
+                return false;
+            }
         }
 
         private sealed class VariantUpdateInput
