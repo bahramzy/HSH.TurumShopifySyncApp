@@ -26,6 +26,7 @@ namespace HSH.TurumShopifySync
             var existingSizes = new List<string>();
             var seenSizes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             bool blockNewVariantCreation = false;
+            var sizeOptionName = GetVariantSizeOptionName(shopifyProductDoc);
 
             try
             {
@@ -98,7 +99,7 @@ namespace HSH.TurumShopifySync
 
                 try
                 {
-                    var createdVariantId = await CreateVariantGraphQlAsync(shopify, productId, size, dkk, turum.sku, tv.ean, ct);
+                    var createdVariantId = await CreateVariantGraphQlAsync(shopify, productId, sizeOptionName, size, dkk, turum.sku, tv.ean, ct);
                     createdAny = true;
                     createdVariants.Add((size, createdVariantId));
                     Console.WriteLine("CREATED variant SKU " + turum.sku + " size " + size + " productId " + productId + " variantId " + createdVariantId);
@@ -109,6 +110,13 @@ namespace HSH.TurumShopifySync
                     {
                         blockNewVariantCreation = true;
                         Console.WriteLine("SKIP creating new variant (connected options): SKU " + turum.sku + " size " + size + " productId " + productId);
+                        continue;
+                    }
+
+                    if (ex.Message.IndexOf("Option does not exist", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        blockNewVariantCreation = true;
+                        Console.WriteLine("SKIP creating new variant (missing Shopify option): SKU " + turum.sku + " size " + size + " option " + sizeOptionName + " productId " + productId);
                         continue;
                     }
 
@@ -190,6 +198,43 @@ namespace HSH.TurumShopifySync
 
             return createdAny || deletedAny;
         }
+
+        private static string GetVariantSizeOptionName(dynamic shopifyProductDoc)
+        {
+            const string defaultOptionName = "Vælg størrelse";
+
+            try
+            {
+                foreach (var option in shopifyProductDoc.product.options)
+                {
+                    var name = ((string)option.name ?? "").Trim();
+                    if (name.Length == 0)
+                        continue;
+
+                    if (name.Equals(defaultOptionName, StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("Size", StringComparison.OrdinalIgnoreCase) ||
+                        name.Equals("Størrelse", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return name;
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                foreach (var option in shopifyProductDoc.product.options)
+                {
+                    var name = ((string)option.name ?? "").Trim();
+                    if (name.Length > 0)
+                        return name;
+                }
+            }
+            catch { }
+
+            return defaultOptionName;
+        }
+
         private static async Task EnsureVariantPositionsBySizeAsync(HttpClient shopify, long productId, dynamic shopifyProductDoc, CancellationToken ct)
         {
             if (shopifyProductDoc == null || shopifyProductDoc.product == null || shopifyProductDoc.product.variants == null)

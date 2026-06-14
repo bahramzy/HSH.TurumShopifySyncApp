@@ -322,7 +322,7 @@ namespace HSH.TurumShopifySync
             public string Sku { get; set; }
         }
 
-        private static async Task<long> CreateVariantGraphQlAsync(HttpClient shopify, long productId, string size, decimal price, string sku, string barcode, CancellationToken ct)
+        private static async Task<long> CreateVariantGraphQlAsync(HttpClient shopify, long productId, string optionName, string size, decimal price, string sku, string barcode, CancellationToken ct)
         {
             const string query = @"
                 mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
@@ -346,7 +346,7 @@ namespace HSH.TurumShopifySync
                         inventoryItem = new { sku = sku, tracked = true, requiresShipping = true },
                         optionValues = new[]
                         {
-                            new { optionName = "Vælg størrelse", name = size }
+                            new { optionName = optionName, name = size }
                         }
                     }
                 }
