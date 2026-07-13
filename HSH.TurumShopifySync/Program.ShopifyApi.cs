@@ -142,7 +142,9 @@ namespace HSH.TurumShopifySync
 
             var json = JsonConvert.SerializeObject(payload);
 
-            for (int attempt = 1; attempt <= 6; attempt++)
+            const int maxAttempts = 12;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 using (var req = new HttpRequestMessage(HttpMethod.Post, "graphql.json"))
                 {
@@ -157,10 +159,15 @@ namespace HSH.TurumShopifySync
                         var doc = JsonConvert.DeserializeObject<JObject>(respJson);
                         await DelayForGraphQlThrottleAsync(doc, ct);
 
-                        if (GraphQlResponseIsThrottled(doc) && attempt < 6)
+                        if (GraphQlResponseIsThrottled(doc))
                         {
-                            await Task.Delay(GetGraphQlThrottleRetryDelay(doc, attempt), ct);
-                            continue;
+                            if (attempt < maxAttempts)
+                            {
+                                await Task.Delay(GetGraphQlThrottleRetryDelay(doc, attempt), ct);
+                                continue;
+                            }
+
+                            throw new Exception("Shopify GraphQL throttled after " + maxAttempts.ToString(CultureInfo.InvariantCulture) + " attempts: " + respJson);
                         }
 
                         return doc.ToObject<T>();
@@ -199,9 +206,11 @@ namespace HSH.TurumShopifySync
             {
                 var requested = ReadGraphQlCostDecimal(doc, "requestedQueryCost");
                 var available = ReadGraphQlCostDecimal(doc, "currentlyAvailable");
-                var missing = Math.Max(10m, requested - available);
-                var seconds = Math.Min(10m, missing / restoreRate);
-                return TimeSpan.FromMilliseconds((double)(seconds * 1000m) + 250);
+                var missing = requested > 0
+                    ? Math.Max(10m, requested - available)
+                    : 50m;
+                var seconds = Math.Min(60m, missing / restoreRate);
+                return TimeSpan.FromMilliseconds((double)(seconds * 1000m) + 500);
             }
 
             return TimeSpan.FromSeconds(Math.Min(10, Math.Pow(2, attempt - 1)));
@@ -214,16 +223,23 @@ namespace HSH.TurumShopifySync
                 return;
 
             var available = ReadGraphQlCostDecimal(doc, "currentlyAvailable");
-            var threshold = 10m;
+            var requested = ReadGraphQlCostDecimal(doc, "requestedQueryCost");
+            if (requested <= 0)
+                requested = ReadGraphQlCostDecimal(doc, "actualQueryCost");
+
+            var maximumAvailable = ReadGraphQlCostDecimal(doc, "maximumAvailable");
+            var threshold = Math.Max(50m, requested + 50m);
+            if (maximumAvailable > 0)
+                threshold = Math.Min(threshold, Math.Max(50m, maximumAvailable - 50m));
 
             if (available >= threshold)
                 return;
 
-            var seconds = Math.Min(2m, (threshold - available) / restoreRate);
+            var seconds = Math.Min(60m, (threshold - available) / restoreRate);
             if (seconds <= 0)
                 return;
 
-            await Task.Delay(TimeSpan.FromMilliseconds((double)(seconds * 1000m) + 100), ct);
+            await Task.Delay(TimeSpan.FromMilliseconds((double)(seconds * 1000m) + 250), ct);
         }
 
         private static decimal ReadGraphQlCostDecimal(JObject doc, string name)
@@ -233,7 +249,7 @@ namespace HSH.TurumShopifySync
                 return 0m;
 
             JToken token;
-            if (name == "currentlyAvailable" || name == "restoreRate")
+            if (name == "currentlyAvailable" || name == "restoreRate" || name == "maximumAvailable")
                 token = cost["throttleStatus"]?[name];
             else
                 token = cost[name];
