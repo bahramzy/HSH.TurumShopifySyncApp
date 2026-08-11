@@ -139,6 +139,11 @@ namespace HSH.TurumShopifySync
                         if (p == null || string.IsNullOrWhiteSpace(p.sku))
                             continue;
 
+                        var sourceBrand = p.brand;
+                        p.brand = NormalizeTurumBrand(p.brand);
+                        if (p.brand.Length == 0 && !string.IsNullOrWhiteSpace(sourceBrand))
+                            Console.WriteLine("[WARN] Ignoring unknown TURUM brand '" + sourceBrand.Trim() + "' for SKU " + p.sku);
+
                         long productId;
                         bool mustCreateNewBecausePo = false;
 
@@ -233,21 +238,6 @@ namespace HSH.TurumShopifySync
                                 }
                             }
 
-                            // If category is Sneakers, and add to Sneakers collection
-                            if (category == "Sneakers")
-                            {
-                                // Set category to Sneakers (via GraphQL API)
-                                await SetShopifyCategorySneakersAsync(shopifyHttp, productId, ct);
-
-                                // Add to Sneakers collection
-                                var sneakersCollectionId = await GetOrCreateCustomCollectionIdAsync(shopifyHttp, "Sneakers", ct);
-                                await EnsureProductInCollectionAsync(shopifyHttp, productId, sneakersCollectionId, ct);
-                            }
-
-                            // Add to brand collection
-                            var brandCollectionId = await GetOrCreateCustomCollectionIdAsync(shopifyHttp, p.brand, ct);
-                            await EnsureProductInCollectionAsync(shopifyHttp, productId, brandCollectionId, ct);
-
                             activeSkuIndex[p.sku] = productId;
 
                             created++;
@@ -284,9 +274,11 @@ namespace HSH.TurumShopifySync
                                 //Console.WriteLine("SKIP product update (unchanged) SKU " + p.sku);
                             }
 
-                            // Ensure category is Sneakers. (uncomment if necessary)
-                            //await SetShopifyCategorySneakersAsync(shopifyHttp, productId, ct);
                         }
+
+                        // Reconcile category and manual collections on every run. This also
+                        // removes stale Sneakers/brand assignments left by older classifications.
+                        await ReconcileProductOrganizationAsync(shopifyHttp, productId, existingProductDoc, p.brand, category, ct);
 
                         // Always fetch product to get variants + inventory_item_id
                         dynamic shopifyProduct = existingProductDoc;

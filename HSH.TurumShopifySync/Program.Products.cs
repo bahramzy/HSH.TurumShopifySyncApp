@@ -129,11 +129,50 @@ namespace HSH.TurumShopifySync
                 "XS", "S", "M", "L", "XL", "XXL", "XXXL"
             };
 
+        private static readonly HashSet<string> ManagedCategoryTags =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Apparel", "Bag", "Bodysuit", "Coat", "Dress", "Headwear",
+                "Hoodie", "Jacket", "Knitwear", "Other", "Pants", "Shirt",
+                "Shorts", "Skirt", "Sneakers", "Socks", "Sweatshirt",
+                "T-shirt", "Underwear", "Vest"
+            };
+
+        private static string NormalizeTurumBrand(string brand)
+        {
+            var normalized = (brand ?? string.Empty).Trim();
+            if (normalized.Length == 0)
+                return string.Empty;
+
+            if (Regex.IsMatch(normalized, @"^(unknown|unkown|n/?a|none|-)$", RegexOptions.IgnoreCase))
+                return string.Empty;
+
+            return normalized;
+        }
+
+        private static bool IsUnknownBrandName(string value)
+        {
+            return !string.IsNullOrWhiteSpace(value) && NormalizeTurumBrand(value).Length == 0;
+        }
+
         private static string DetectTurumCategory(dynamic p)
         {
             var name = ((string)p.name ?? string.Empty).ToLowerInvariant();
 
+            // Explicit sneaker model names must win over colorway names that contain
+            // apparel words, e.g. "Jordan 3 Retro Lucky Shorts".
+            if (Regex.IsMatch(name, @"\b(?:air\s+)?jordan\s*(?:1|2|3|4|5|6|7|8|9|10|11|12|13|14)\s+(?:retro|mid|low|high)\b"))
+                return "Sneakers";
+
             // 1) Accessories / Apparel (high precision first)
+
+            // Headwear
+            if (Regex.IsMatch(name, @"\b(beanie|balaclava|bucket hat|cap|hat|headwear)\b"))
+                return "Headwear";
+
+            // Baby clothing
+            if (Regex.IsMatch(name, @"\b(body[ -]?suit|baby grow|onesie|romper)\b"))
+                return "Bodysuit";
 
             // Bags
             if (Regex.IsMatch(name, @"\b(shoulder bag|waist bag|crossbody|tote|duffel|backpack|bag)\b"))
@@ -167,6 +206,22 @@ namespace HSH.TurumShopifySync
             if (Regex.IsMatch(name, @"\b(t-?shirt|tshirt|graphic tee|short sleeve tee|long sleeve( tee)?|tee)\b"))
                 return "T-shirt";
 
+            // Other apparel
+            if (Regex.IsMatch(name, @"\b(shorts?|swim shorts?|trunks)\b"))
+                return "Shorts";
+            if (Regex.IsMatch(name, @"\b(button[- ]?down|shirt|jersey|polo)\b"))
+                return "Shirt";
+            if (Regex.IsMatch(name, @"\b(sweater|jumper|cardigan|knit|knitted|knitwear)\b"))
+                return "Knitwear";
+            if (Regex.IsMatch(name, @"\b(vest|gilet|waistcoat)\b"))
+                return "Vest";
+            if (Regex.IsMatch(name, @"\b(dress)\b"))
+                return "Dress";
+            if (Regex.IsMatch(name, @"\b(skirt)\b"))
+                return "Skirt";
+            if (Regex.IsMatch(name, @"\b(boxers?|briefs?|underwear)\b"))
+                return "Underwear";
+
             // 2) Positive shoe detection (after apparel/accessories)
 
             if (Regex.IsMatch(
@@ -177,7 +232,7 @@ namespace HSH.TurumShopifySync
                     @"boot(s)?|chelsea|chukka|workboot|hiking|trail|" +
                     @"sandal(s)?|slide(s)?|clog(s)?|" +
                     @"gazelle|campus|samba|superstar|stan smith|" +
-                    @"air max|air force|air jordan|jordan|dunk|blazer|" +
+                    @"air max|air force|air jordan|jordan\s*(?:1|2|3|4|5|6|7|8|9|10|11|12|13|14)|dunk|blazer|" +
                     @"new balance|nb\b|asics|gel-?\w+|salomon|xt-?\w+|" +
                     @"converse|chuck|vans|old skool|sk8-?hi" +
                     @")\b"))
@@ -201,9 +256,9 @@ namespace HSH.TurumShopifySync
                 }
             }
 
-            // 4) Default
-            // Change to "Unknown" if you want zero false Sneaker defaults.
-            return "Sneakers";
+            // 4) Conservative default: an unrecognized product must never become
+            // a sneaker merely because its name/size did not match a known rule.
+            return "Other";
         }
 
         // ==========================
@@ -212,90 +267,21 @@ namespace HSH.TurumShopifySync
 
         private static string TagsMergeAndCleanUp(dynamic shopifyProduct, TurumProduct turumProduct, string category)
         {
-            // Merge tags
             var existingTagsCsv = (string)(shopifyProduct?.product.tags ?? "");
-            var mergedTags = MergeTags(existingTagsCsv, new[]
+            var cleanedExistingTags = existingTagsCsv
+                .Split(',')
+                .Select(t => t.Trim())
+                .Where(t => t.Length > 0)
+                .Where(t => !ManagedCategoryTags.Contains(t))
+                .Where(t => !t.Equals("Footwear", StringComparison.OrdinalIgnoreCase))
+                .Where(t => !IsUnknownBrandName(t));
+
+            var mergedTags = MergeTags(string.Join(", ", cleanedExistingTags), new[]
             {
-                    turumProduct.brand,
-                    turumProduct.brand.ToLower(),
-                    ToTitleCase(turumProduct.brand),
-                    category,
-                    "TURUM"
+                NormalizeTurumBrand(turumProduct.brand),
+                category,
+                "TURUM"
             });
-
-            var hasTShirt = existingTagsCsv
-                .Split(',')
-                .Select(t => t.Trim())
-                .Any(t => t.Equals("T-shirt", StringComparison.OrdinalIgnoreCase));
-
-            // CLEANUP RULE - remove T-shirt tag if it is sneaker
-            // if category is Sneakers and existingTagsCsv contain 'T-shirt', remove T-shirt tag if present (cleanup old tagging mistakes)
-            if (string.Equals(category, "Sneakers", StringComparison.OrdinalIgnoreCase) && hasTShirt)
-            {
-                var list = mergedTags
-                    .Split(',')
-                    .Select(t => t.Trim())
-                    .Where(t => !string.Equals(t, "T-shirt", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                mergedTags = string.Join(", ", list);
-
-                Console.WriteLine("Removed T-shirt tag (is sneaker) SKU " + turumProduct.sku);
-            }
-
-            var hasSneakers = existingTagsCsv
-                .Split(',')
-                .Select(t => t.Trim())
-                .Any(t => t.Equals("Sneakers", StringComparison.OrdinalIgnoreCase));
-
-            //
-            // CLEANUP RULE - remove Sneakers tag if not sneaker
-            if (!string.Equals(category, "Sneakers", StringComparison.OrdinalIgnoreCase) && hasSneakers)
-            {
-                var list = mergedTags
-                    .Split(',')
-                    .Select(t => t.Trim())
-                    .Where(t => !string.Equals(t, "Sneakers", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                mergedTags = string.Join(", ", list);
-
-                Console.WriteLine("Removed Sneakers tag (not sneaker) SKU " + turumProduct.sku);
-            }
-
-            // CLEANUP - Remove Apparel tag if it Sneakers
-            var hasApparel = existingTagsCsv
-                .Split(',')
-                .Select(t => t.Trim())
-                .Any(t => t.Equals("Apparel", StringComparison.OrdinalIgnoreCase));
-            if (string.Equals(category, "Sneakers", StringComparison.OrdinalIgnoreCase) && hasApparel)
-            {
-                var list = mergedTags
-                    .Split(',')
-                    .Select(t => t.Trim())
-                    .Where(t => !string.Equals(t, "Apparel", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                mergedTags = string.Join(", ", list);
-                Console.WriteLine("Removed Apparel tag (not apparel) SKU " + turumProduct.sku);
-            }
-
-            // CLEANUP - Remove Footwear tag if it exists (we don't use this tag any more)
-            var hasFootwear = existingTagsCsv
-                .Split(',')
-                .Select(t => t.Trim())
-                .Any(t => t.Equals("Footwear", StringComparison.OrdinalIgnoreCase));
-            if (hasFootwear)
-            {
-                var list = mergedTags
-                    .Split(',')
-                    .Select(t => t.Trim())
-                    .Where(t => !string.Equals(t, "Footwear", StringComparison.OrdinalIgnoreCase))
-                    .ToList();
-
-                mergedTags = string.Join(", ", list);
-                Console.WriteLine("Removed Footwear tag (not sneakers) SKU " + turumProduct.sku);
-            }
 
             // Add popular models tags for sneakers that have these keywords in the name (Air Max 95, Air Max Plus, Air Max 1, Dn8, Tasman, and 2002R)
             if (string.Equals(category, "Sneakers", StringComparison.OrdinalIgnoreCase))
