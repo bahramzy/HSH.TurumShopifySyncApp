@@ -104,6 +104,8 @@ namespace HSH.TurumShopifySync
                       productType
                       tags
                       status
+                      category { id }
+                      collections(first: 100) { nodes { id title } }
                       media(first: 1) {
                         nodes {
                           ... on MediaImage { image { url } }
@@ -319,6 +321,82 @@ namespace HSH.TurumShopifySync
             }
 
             ThrowIfUserErrors(doc.data.productVariantsBulkUpdate.userErrors, "productVariantsBulkUpdate " + productId);
+        }
+
+        private static async Task ReconcileProductOrganizationAsync(
+            HttpClient shopify,
+            long productId,
+            dynamic existingProductDoc,
+            string brand,
+            string category,
+            CancellationToken ct)
+        {
+            var existingCategoryId = "";
+            var existingVendor = "";
+            var existingCollections = new Dictionary<long, string>();
+
+            try { existingCategoryId = (string)(existingProductDoc?.product.category_id ?? ""); } catch { }
+            try { existingVendor = (string)(existingProductDoc?.product.vendor ?? ""); } catch { }
+            try
+            {
+                foreach (var collection in existingProductDoc.product.collections)
+                    existingCollections[(long)collection.id] = (string)collection.title;
+            }
+            catch { }
+
+            var fields = new Dictionary<string, object> { { "id", ProductGid(productId) } };
+            var collectionsToJoin = new HashSet<long>();
+            var collectionsToLeave = new HashSet<long>();
+            var isSneakers = string.Equals(category, "Sneakers", StringComparison.OrdinalIgnoreCase);
+
+            if (isSneakers)
+            {
+                if (!string.Equals(existingCategoryId, Settings.ShopifySneakersCategoryId, StringComparison.OrdinalIgnoreCase))
+                    fields["category"] = Settings.ShopifySneakersCategoryId;
+
+                var sneakersCollectionId = await GetOrCreateCustomCollectionIdAsync(shopify, "Sneakers", ct);
+                if (!existingCollections.ContainsKey(sneakersCollectionId))
+                    collectionsToJoin.Add(sneakersCollectionId);
+            }
+            else
+            {
+                if (string.Equals(existingCategoryId, Settings.ShopifySneakersCategoryId, StringComparison.OrdinalIgnoreCase))
+                    fields["category"] = null;
+
+                foreach (var collection in existingCollections)
+                {
+                    if (string.Equals(collection.Value, "Sneakers", StringComparison.OrdinalIgnoreCase))
+                        collectionsToLeave.Add(collection.Key);
+                }
+            }
+
+            var normalizedBrand = NormalizeTurumBrand(brand);
+            if (normalizedBrand.Length > 0)
+            {
+                var brandCollectionId = await GetOrCreateCustomCollectionIdAsync(shopify, normalizedBrand, ct);
+                if (!existingCollections.ContainsKey(brandCollectionId))
+                    collectionsToJoin.Add(brandCollectionId);
+            }
+
+            var normalizedExistingVendor = NormalizeTurumBrand(existingVendor);
+            foreach (var collection in existingCollections)
+            {
+                if (IsUnknownBrandName(collection.Value))
+                    collectionsToLeave.Add(collection.Key);
+                else if (normalizedExistingVendor.Length > 0 &&
+                         !string.Equals(normalizedExistingVendor, normalizedBrand, StringComparison.OrdinalIgnoreCase) &&
+                         string.Equals(collection.Value, normalizedExistingVendor, StringComparison.OrdinalIgnoreCase))
+                    collectionsToLeave.Add(collection.Key);
+            }
+
+            collectionsToLeave.ExceptWith(collectionsToJoin);
+            if (collectionsToJoin.Count > 0)
+                fields["collectionsToJoin"] = collectionsToJoin.Select(CollectionGid).ToArray();
+            if (collectionsToLeave.Count > 0)
+                fields["collectionsToLeave"] = collectionsToLeave.Select(CollectionGid).ToArray();
+
+            if (fields.Count > 1)
+                await UpdateShopifyProductGraphQlAsync(shopify, productId, fields, ct);
         }
 
         private static bool ProductVariantErrorsAreOnlyMissing(dynamic userErrors)

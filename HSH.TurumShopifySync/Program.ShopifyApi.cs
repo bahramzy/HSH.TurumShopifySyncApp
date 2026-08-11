@@ -275,6 +275,8 @@ namespace HSH.TurumShopifySync
                     productType
                     tags
                     status
+                    category { id }
+                    collections(first: 100) { nodes { id title } }
                     media(first: 1) {
                       nodes {
                         ... on MediaImage { image { url } }
@@ -321,7 +323,23 @@ namespace HSH.TurumShopifySync
             catch { tagsCsv = ""; }
 
             var flatVariants = new List<object>();
+            var flatCollections = new List<object>();
             string firstImageSrc = "";
+            string categoryId = "";
+
+            try { categoryId = (string)(p.category?.id ?? ""); } catch { }
+            try
+            {
+                foreach (var collection in p.collections.nodes)
+                {
+                    flatCollections.Add(new
+                    {
+                        id = ExtractLegacyIdFromGid((string)collection.id),
+                        title = (string)collection.title
+                    });
+                }
+            }
+            catch { }
 
             try
             {
@@ -399,6 +417,8 @@ namespace HSH.TurumShopifySync
                     vendor = (string)p.vendor,
                     product_type = (string)p.productType,
                     tags = tagsCsv,
+                    category_id = categoryId,
+                    collections = flatCollections,
                     image_src = firstImageSrc,
                     options = NormalizeOptions(p.options),
                     variants = flatVariants
