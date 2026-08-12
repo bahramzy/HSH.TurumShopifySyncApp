@@ -140,9 +140,6 @@ namespace HSH.TurumShopifySync
                             continue;
 
                         var sourceBrand = p.brand;
-                        p.brand = NormalizeTurumBrand(p.brand);
-                        if (p.brand.Length == 0 && !string.IsNullOrWhiteSpace(sourceBrand))
-                            Console.WriteLine("[WARN] Ignoring unknown TURUM brand '" + sourceBrand.Trim() + "' for SKU " + p.sku);
 
                         long productId;
                         bool mustCreateNewBecausePo = false;
@@ -200,6 +197,15 @@ namespace HSH.TurumShopifySync
                                 productFetchTimer += opTimer.Elapsed;
                                 liveProductFetches++;
                             }
+                        }
+
+                        p.brand = ResolveTurumBrand(sourceBrand, p.name);
+
+                        if (NormalizeTurumBrand(sourceBrand).Length == 0)
+                        {
+                            Console.WriteLine(
+                                "[WARN] Resolved TURUM brand '" + ((sourceBrand ?? string.Empty).Trim()) +
+                                "' to '" + p.brand + "' for SKU " + p.sku);
                         }
 
                         if (!activeSkuIndex.ContainsKey(p.sku) || mustCreateNewBecausePo)
