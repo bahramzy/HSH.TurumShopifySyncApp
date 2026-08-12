@@ -126,7 +126,8 @@ namespace HSH.TurumShopifySync
         private static readonly HashSet<string> ApparelSizes =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
-                "XS", "S", "M", "L", "XL", "XXL", "XXXL"
+                "XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL",
+                "2XL", "3XL", "4XL"
             };
 
         private static readonly HashSet<string> ManagedCategoryTags =
@@ -206,8 +207,12 @@ namespace HSH.TurumShopifySync
             // 1) Accessories / Apparel (high precision first)
 
             // Headwear
-            if (Regex.IsMatch(name, @"\b(beanie|balaclava|bucket hat|cap|hat|headwear)\b"))
+            if (Regex.IsMatch(name, @"\b(beanie|balaclava|bucket hat|cap|hat|headwear|new era|[56]-panel)\b"))
                 return "Headwear";
+
+            // Non-wearable accessories occasionally arrive from Turum as "shoes".
+            if (Regex.IsMatch(name, @"\b(packing tape|adhesive tape|tape roll)\b"))
+                return "Other";
 
             // Baby clothing
             if (Regex.IsMatch(name, @"\b(body[ -]?suit|baby grow|onesie|romper)\b"))
@@ -279,7 +284,16 @@ namespace HSH.TurumShopifySync
                 return "Sneakers";
             }
 
-            // 3) Size-based fallback (last resort)
+            // 3) Turum's structured category is a stronger fallback than model-name
+            // guessing. Explicit apparel/accessory rules above still protect the
+            // known cases where Turum incorrectly labels those products as shoes.
+            var turumCategory = ((string)p.category ?? string.Empty).Trim();
+            if (turumCategory.Equals("shoes", StringComparison.OrdinalIgnoreCase))
+                return "Sneakers";
+            if (turumCategory.Equals("apparel", StringComparison.OrdinalIgnoreCase))
+                return "Apparel";
+
+            // 4) Size-based fallback for feeds without a usable category
             if (p.variants != null)
             {
                 foreach (var v in p.variants)
@@ -289,13 +303,14 @@ namespace HSH.TurumShopifySync
                     if (ApparelSizes.Contains(size))
                         return "Apparel";
 
-                    // Waist / inseam sizes: 32/32, 30-32, W32
-                    if (Regex.IsMatch(size, @"^(W)?\d{2}([/-]\d{2})?$"))
+                    // Waist / inseam sizes: 32/32, 30-32, W32. A plain numeric
+                    // size such as 43 is a common EU shoe size, not apparel.
+                    if (Regex.IsMatch(size, @"^(W\d{2}|\d{2}[/-]\d{2})$"))
                         return "Apparel";
                 }
             }
 
-            // 4) Conservative default: an unrecognized product must never become
+            // 5) Conservative default: an unrecognized product must never become
             // a sneaker merely because its name/size did not match a known rule.
             return "Other";
         }
