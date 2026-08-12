@@ -150,6 +150,45 @@ namespace HSH.TurumShopifySync
             return normalized;
         }
 
+        private static string ResolveTurumBrand(string sourceBrand, string productName)
+        {
+            var normalizedSourceBrand = NormalizeTurumBrand(sourceBrand);
+            if (normalizedSourceBrand.Length > 0)
+                return normalizedSourceBrand;
+
+            var name = (productName ?? string.Empty).Trim();
+            var knownPrefixes = new[]
+            {
+                new { Pattern = @"^new balance\b", Brand = "NEW BALANCE" },
+                new { Pattern = @"^(?:air )?jordan\b", Brand = "AIR JORDAN" },
+                new { Pattern = @"^adidas\b", Brand = "ADIDAS" },
+                new { Pattern = @"^nike\b", Brand = "NIKE" },
+                new { Pattern = @"^asics\b", Brand = "ASICS" },
+                new { Pattern = @"^converse\b", Brand = "CONVERSE" },
+                new { Pattern = @"^crocs\b", Brand = "CROCS" },
+                new { Pattern = @"^salomon\b", Brand = "SALOMON" },
+                new { Pattern = @"^puma\b", Brand = "PUMA" },
+                new { Pattern = @"^reebok\b", Brand = "REEBOK" },
+                new { Pattern = @"^vans\b", Brand = "VANS" },
+                new { Pattern = @"^ugg\b", Brand = "UGG" },
+                new { Pattern = @"^hoka\b", Brand = "HOKA" },
+                new { Pattern = @"^birkenstock\b", Brand = "BIRKENSTOCK" },
+                new { Pattern = @"^supreme\b", Brand = "SUPREME" },
+                new { Pattern = @"^stussy\b", Brand = "STUSSY" },
+                new { Pattern = @"^ami paris\b", Brand = "AMI PARIS" }
+            };
+
+            foreach (var candidate in knownPrefixes)
+            {
+                if (Regex.IsMatch(name, candidate.Pattern, RegexOptions.IgnoreCase))
+                    return candidate.Brand;
+            }
+
+            // Shopify displays the shop name when vendor is empty. Use an explicit
+            // fallback so the shop's default vendor never leaks into the Brand filter.
+            return "OTHER";
+        }
+
         private static bool IsUnknownBrandName(string value)
         {
             return !string.IsNullOrWhiteSpace(value) && NormalizeTurumBrand(value).Length == 0;
