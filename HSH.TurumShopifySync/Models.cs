@@ -25,6 +25,7 @@ namespace HSH.TurumShopifySync
         public string name { get; set; }
         public decimal price { get; set; }
         public string brand { get; set; }
+        public string category { get; set; }
         public List<TurumVariant> variants { get; set; }
     }
 
