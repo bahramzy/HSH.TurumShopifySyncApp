@@ -79,7 +79,7 @@ namespace HSH.TurumShopifySync
 
                 if (!seenSizes.Add(size)) continue;
 
-                var raw = ConvertToDkk(tv.price) * Settings.MomsRate + Settings.Profit;
+                var raw = CalculateSalesPrice(tv.price);
                 var dkk = RoundRetailPrice(raw);
 
                 dynamic existing;

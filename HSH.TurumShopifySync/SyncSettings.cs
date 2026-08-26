@@ -10,6 +10,9 @@ namespace HSH.TurumShopifySync
         public string ShopifySneakersCategoryId { get; set; }
         public decimal EurToDkkRate { get; set; }
         public decimal MomsRate { get; set; }
+        public decimal TurumFreight { get; set; }
+        public decimal OtherFreight { get; set; }
+        public decimal ShopifyCardFee { get; set; }
         public decimal Profit { get; set; }
         public string ShopifyClientId { get; set; }
         public string ShopifyClientSecret { get; set; }
@@ -27,7 +30,10 @@ namespace HSH.TurumShopifySync
                 ShopifySneakersCategoryId = GetString("SHOPIFY_SNEAKERS_CATEGORY_ID", "gid://shopify/TaxonomyCategory/aa-8-8"),
                 EurToDkkRate = GetDecimal("EUR_TO_DKK_RATE", 7.47m),
                 MomsRate = GetDecimal("MOMS_RATE", 1.25m),
-                Profit = GetDecimal("PROFIT_DKK", 375m),
+                TurumFreight = GetDecimal("TURUM_FREIGHT_DKK", 75m),
+                OtherFreight = GetDecimal("OTHER_FREIGHT_DKK", 39m),
+                ShopifyCardFee = GetDecimal("SHOPIFY_CARD_FEE_DKK", 25m),
+                Profit = GetDecimal("PROFIT_DKK", 250m),
                 ShopifyClientId = Environment.GetEnvironmentVariable("SHOPIFY_CLIENT_ID"),
                 ShopifyClientSecret = Environment.GetEnvironmentVariable("SHOPIFY_CLIENT_SECRET"),
                 ShopifyAdminToken = Environment.GetEnvironmentVariable("SHOPIFY_ADMIN_TOKEN"),
