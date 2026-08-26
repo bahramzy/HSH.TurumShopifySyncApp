@@ -71,6 +71,16 @@ namespace HSH.TurumShopifySync
             return eur * Settings.EurToDkkRate; // NO rounding here
         }
 
+        private static decimal CalculateSalesPrice(decimal turumPrice)
+        {
+            return (ConvertToDkk(turumPrice)
+                    + Settings.TurumFreight
+                    + Settings.OtherFreight
+                    + Settings.ShopifyCardFee
+                    + Settings.Profit)
+                   * Settings.MomsRate;
+        }
+
         //private static decimal RoundRetailPrice(decimal price)
         //{
         //    // Danish sneaker style: 749,95
